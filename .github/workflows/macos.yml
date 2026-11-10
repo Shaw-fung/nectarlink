@@ -69,5 +69,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: macos
-          path: dist/Nectarlink-*.dmg
+          path: dist/NectarLink-*.dmg
           if-no-files-found: error
