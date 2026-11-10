@@ -75,15 +75,55 @@ jobs:
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build (Windows / Linux / macOS ARM)
+    name: Build (Windows / Linux)
     needs: sync
     if: needs.sync.outputs.changed == 'true' || inputs.force
     uses: ./.github/workflows/build-all.yml
 
+  # macOS Apple Silicon build, decoupled so a scarce-runner queue or failure can
+  # never block the Windows/Linux release. Its artifact (if it completes) is
+  # picked up by publish; if it is cancelled, the other platforms still ship.
+  macos-arm64:
+    name: macOS app (Apple Silicon)
+    needs: [sync]
+    if: needs.sync.outputs.changed == 'true' || inputs.force
+    runs-on: macos-latest
+    continue-on-error: true
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      QT_VERSION: "6.12.0"
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: main }
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: mirror-macos-app, save-if: true }
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtshadertools
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Build the desktop app
+        run: cargo build --release -p nectarlink-desktop
+      - name: Package the .app and .dmg
+        run: bash desktop/packaging/macos/build-app.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: macos-arm64
+          path: dist/NectarLink-*.dmg
+
   publish:
     name: Publish the release
-    needs: [sync, build]
-    if: needs.build.result == 'success'
+    needs: [build]
+    if: needs.sync.result == 'success'
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -114,6 +154,16 @@ jobs:
           done
           shopt -u nullglob
           cat SHA256SUMS.txt
+
+          # Guard: if no platform produced anything, skip the release entirely
+          # instead of publishing an empty one.
+          shopt -s nullglob
+          HAVE=( *.exe *.deb *.rpm *.AppImage *.tar.gz *.dmg )
+          shopt -u nullglob
+          if [ "${#HAVE[@]}" -eq 0 ]; then
+            echo "No build artifacts collected — skipping release."
+            exit 0
+          fi
 
           # What changed since the last published build (for the update notes).
           if git rev-parse -q --verify nightly >/dev/null 2>&1; then
