@@ -48,7 +48,6 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>LSRequiresNativeExecution</key><true/>
 </dict>
 </plist>
 PLIST
@@ -87,7 +86,7 @@ mkdir -p "$STAGE/dmg"
 cp -R "$APP" "$STAGE/dmg/"
 ln -s /Applications "$STAGE/dmg/Applications"
 
-DMG="dist/$APP_NAME-${VERSION}-macOS.dmg"
+DMG="dist/$APP_NAME-${VERSION}-macOS-$(uname -m).dmg"
 mkdir -p dist
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE/dmg" -ov -format UDZO "$DMG"
 
