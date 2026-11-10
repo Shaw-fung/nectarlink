@@ -2,16 +2,17 @@
 # Mirror pipeline for NectarLink:
 #   1. sync  — merge upstream (thtbee/nectarlink) main into this fork, so the
 #              fork tracks upstream and the version number follows it.
-#   2. build — call build-all.yml (Windows x64/ARM64, Linux x86_64, macOS
-#              Apple Silicon) — only when upstream actually advanced, so idle
-#              days cost nothing.
+#   2. build — call build-all.yml (Windows x64/ARM64, Linux x86_64) — only when
+#              upstream actually advanced, so idle days cost nothing.
 #   3. publish — gather the successful platforms' artifacts and put them on a
 #              rolling GitHub Release (tag "nightly") with install + update
-#              notes. This does NOT wait for the Intel macOS build.
-#   4. macos-intel — a DECOUPLED, best-effort Intel (x86_64) macOS build that
-#              runs AFTER publish and attaches its .dmg to the same nightly
-#              release. It can queue for a long time on GitHub's scarce Intel
-#              runners and must never block the other platforms from shipping.
+#              notes.
+#
+# macOS (Apple Silicon + Intel) is handled by a SEPARATE workflow,
+# macos-nightly.yml. It runs independently (its own concurrency group, its own
+# runner queue) and attaches its .dmg to the same nightly release. This keeps
+# GitHub's scarce macOS runners from ever blocking or holding a lock on the
+# Windows/Linux release.
 #
 # Trigger: Actions -> Nightly all -> Run workflow (force builds even with no
 # upstream change). No local compilation needed; everything runs on GitHub.
@@ -80,46 +81,6 @@ jobs:
     if: needs.sync.outputs.changed == 'true' || inputs.force
     uses: ./.github/workflows/build-all.yml
 
-  # macOS Apple Silicon build, decoupled so a scarce-runner queue or failure can
-  # never block the Windows/Linux release. Its artifact (if it completes) is
-  # picked up by publish; if it is cancelled, the other platforms still ship.
-  macos-arm64:
-    name: macOS app (Apple Silicon)
-    needs: [sync]
-    if: needs.sync.outputs.changed == 'true' || inputs.force
-    runs-on: macos-latest
-    continue-on-error: true
-    timeout-minutes: 120
-    env:
-      CARGO_TERM_COLOR: always
-      QT_VERSION: "6.12.0"
-    steps:
-      - uses: actions/checkout@v7
-        with: { ref: main }
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with: { shared-key: mirror-macos-app, save-if: true }
-      - name: Install Qt ${{ env.QT_VERSION }}
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtshadertools
-          cache: true
-          aqtsource: git+https://github.com/miurahr/aqtinstall.git
-      - name: Build the desktop app
-        run: cargo build --release -p nectarlink-desktop
-      - name: Package the .app and .dmg
-        run: bash desktop/packaging/macos/build-app.sh
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: macos-arm64
-          path: dist/NectarLink-*.dmg
-
   publish:
     name: Publish the release
     needs: [sync, build]
@@ -145,24 +106,23 @@ jobs:
       - name: Publish it as a rolling release
         run: |
           set -euo pipefail
-          mkdir -p files
-          cd files
+          mkdir -p files out
+          # Artifacts land in nested dirs (each upload preserves its tree);
+          # flatten every file into ./out so the release + checksums are clean.
+          find files -type f -exec sh -c 'cp "$1" out/' _ {} \;
+          cd out
 
           # Hash whatever actually landed (platforms that failed to build are
           # simply absent — never let a missing glob abort the release).
           rm -f SHA256SUMS.txt
-          shopt -s nullglob
           for f in *; do
             [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS.txt
           done
-          shopt -u nullglob
           cat SHA256SUMS.txt
 
           # Guard: if no platform produced anything, skip the release entirely
           # instead of publishing an empty one.
-          shopt -s nullglob
-          HAVE=( *.exe *.deb *.rpm *.AppImage *.tar.gz *.dmg )
-          shopt -u nullglob
+          HAVE=( *.exe *.deb *.rpm *.AppImage *.tar.gz )
           if [ "${#HAVE[@]}" -eq 0 ]; then
             echo "No build artifacts collected — skipping release."
             exit 0
@@ -176,13 +136,6 @@ jobs:
           fi
           if [ ! -s changes.txt ]; then
             echo "(no upstream commits since the last build)" > changes.txt
-          fi
-
-          # Intel line depends on whether its .dmg is present in this drop.
-          if ls NectarLink-*-x86_64.dmg >/dev/null 2>&1; then
-            INTEL="- Intel 芯片：下载 \`NectarLink-$VERSION-macOS-x86_64.dmg\`。"
-          else
-            INTEL="- Intel 芯片：**本次未随主体发布**（GitHub 的 Intel macOS 运行器资源紧张、需排队）；该版本在发布后作为补充自动上传到同一 Release，或在后续构建周期补齐。"
           fi
 
           # Install + update notes.
@@ -205,10 +158,10 @@ jobs:
 
           ### macOS
           - Apple 芯片（M 系列）：下载 \`NectarLink-$VERSION-macOS-arm64.dmg\`，挂载后拖入“应用程序”。
-          $INTEL
+          - Intel 芯片：下载 \`NectarLink-$VERSION-macOS-x86_64.dmg\`。
+          - 说明：macOS 构建在独立的 best-effort 工作流中完成（Apple 芯片与 Intel 双架构），成功后自动附加到本 Release。若资产列表暂无 .dmg，说明本次 GitHub 的 macOS 运行器仍在排队，通常会在数小时内或下个构建周期补齐。官方“预览版”可用：文件传输、剪贴板、通知等；屏幕镜像 / 虚拟摄像头等重功能尚未完成。
           - 首次打开会被 Gatekeeper 拦截（ad-hoc 签名）：右键 App → 打开，或在终端执行
             \`sudo xattr -rd com.apple.quarantine /Applications/NectarLink.app\`。
-          - 说明：macOS 为官方“预览版”，文件传输、剪贴板、通知等可用；屏幕镜像 / 虚拟摄像头等重功能尚未完成。
 
           ## 更新说明（自上次构建以来的提交）
           EOF
@@ -219,9 +172,7 @@ jobs:
           } >> notes.md
 
           # Build the file list dynamically (only what exists).
-          shopt -s nullglob
-          FILES=( *.exe *.deb *.rpm *.AppImage *.tar.gz *.dmg install.sh SHA256SUMS.txt notes.md )
-          shopt -u nullglob
+          FILES=( *.exe *.deb *.rpm *.AppImage *.tar.gz install.sh SHA256SUMS.txt notes.md )
 
           # Rolling release: replace the previous "nightly" release + tag.
           gh release delete nightly --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
@@ -231,48 +182,3 @@ jobs:
             --title "NectarLink v$VERSION · 自动构建 ($(date -u +%Y-%m-%d))" \
             --notes-file notes.md
           echo "published nightly @ $VERSION"
-
-  macos-intel:
-    name: macOS app (Intel) — best effort, attaches after publish
-    needs: [publish]
-    if: needs.publish.result == 'success'
-    runs-on: macos-13
-    continue-on-error: true
-    timeout-minutes: 120
-    env:
-      CARGO_TERM_COLOR: always
-      QT_VERSION: "6.12.0"
-    steps:
-      - uses: actions/checkout@v7
-        with: { ref: main }
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with: { shared-key: mirror-macos-intel, save-if: true }
-      - name: Install Qt ${{ env.QT_VERSION }}
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtshadertools
-          cache: true
-          aqtsource: git+https://github.com/miurahr/aqtinstall.git
-      - name: Build the desktop app
-        run: cargo build --release -p nectarlink-desktop
-      - name: Package the .app and .dmg
-        run: bash desktop/packaging/macos/build-app.sh
-      - name: Attach the Intel .dmg to the nightly release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          DMG=$(ls dist/NectarLink-*-x86_64.dmg 2>/dev/null || true)
-          if [ -n "$DMG" ]; then
-            gh release upload nightly "$DMG" \
-              --repo "$GITHUB_REPOSITORY" --clobber || true
-            echo "attached $DMG to nightly"
-          else
-            echo "no Intel dmg produced; skipping attach"
-          fi

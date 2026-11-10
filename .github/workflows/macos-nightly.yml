@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Best-effort macOS builds for the NectarLink mirror. Runs independently of
+# the Windows/Linux pipeline so GitHub's scarce macOS runners can never block
+# or hold a lock on the other platforms' release.
+#
+# What it does:
+#   - Builds the Apple Silicon (.dmg) on macos-latest and the Intel (.dmg) on
+#     macos-13, each as its own job with a hard timeout so it can't queue
+#     forever and waste a runner slot reservation.
+#   - Each job is a no-op if its .dmg is already attached to the nightly
+#     release (so we don't burn scarce macOS minutes rebuilding the same thing).
+#   - An attach job uploads whatever .dmg actually got built onto the existing
+#     "nightly" release (gh release upload --clobber).
+#
+# Triggers:
+#   - workflow_run: right after "Nightly all" finishes publishing.
+#   - schedule: a couple of retry windows later the same day, in case the
+#     macOS runners were still queued the first time.
+#   - workflow_dispatch: manual "Run workflow" (force) from the Actions tab.
+name: macOS nightly
+
+on:
+  workflow_run:
+    workflows: ["Nightly all"]
+    types: [completed]
+  schedule:
+    - cron: "30 19 * * *"   # ~1.5h after the nightly build, retry window
+    - cron: "30 22 * * *"   # another retry window later the same day
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build macOS even if the .dmg is already attached"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-nightly
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    name: macOS app (Apple Silicon)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+      QT_VERSION: "6.12.0"
+    steps:
+      - name: Skip if already attached (or no release yet)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "no nightly release yet; skipping"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "${{ inputs.force }}" != "true" ] && \
+             gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
+               | grep -q "macOS-arm64.dmg"; then
+            echo "arm64 dmg already attached; skipping"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        if: steps.guard.outputs.skip != 'true'
+        with: { ref: main }
+      - name: Install the pinned Rust toolchain
+        if: steps.guard.outputs.skip != 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        if: steps.guard.outputs.skip != 'true'
+        with: { shared-key: mirror-macos-app, save-if: true }
+      - name: Install Qt ${{ env.QT_VERSION }}
+        if: steps.guard.outputs.skip != 'true'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtshadertools
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Build the desktop app
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo build --release -p nectarlink-desktop
+      - name: Package the .app and .dmg
+        if: steps.guard.outputs.skip != 'true'
+        run: bash desktop/packaging/macos/build-app.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          name: macos-arm64
+          path: dist/NectarLink-*.dmg
+
+  macos-intel:
+    name: macOS app (Intel)
+    runs-on: macos-13
+    timeout-minutes: 90
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+      QT_VERSION: "6.12.0"
+    steps:
+      - name: Skip if already attached (or no release yet)
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "no nightly release yet; skipping"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "${{ inputs.force }}" != "true" ] && \
+             gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
+               | grep -q "macOS-x86_64.dmg"; then
+            echo "intel dmg already attached; skipping"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        if: steps.guard.outputs.skip != 'true'
+        with: { ref: main }
+      - name: Install the pinned Rust toolchain
+        if: steps.guard.outputs.skip != 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        if: steps.guard.outputs.skip != 'true'
+        with: { shared-key: mirror-macos-intel, save-if: true }
+      - name: Install Qt ${{ env.QT_VERSION }}
+        if: steps.guard.outputs.skip != 'true'
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtshadertools
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+      - name: Build the desktop app
+        if: steps.guard.outputs.skip != 'true'
+        run: cargo build --release -p nectarlink-desktop
+      - name: Package the .app and .dmg
+        if: steps.guard.outputs.skip != 'true'
+        run: bash desktop/packaging/macos/build-app.sh
+      - uses: actions/upload-artifact@v7
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          name: macos-intel
+          path: dist/NectarLink-*.dmg
+
+  attach:
+    name: Attach the .dmg to the nightly release
+    needs: [macos-arm64, macos-intel]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dmgs
+          merge-multiple: true
+        continue-on-error: true
+      - name: Upload whatever got built
+        run: |
+          set -euo pipefail
+          mkdir -p dmgs out
+          find dmgs -type f -name '*.dmg' -exec sh -c 'cp "$1" out/' _ {} \;
+          if [ -z "$(ls -A out 2>/dev/null)" ]; then
+            echo "no macOS dmg produced this run (runners likely still queued); nothing to attach"
+            exit 0
+          fi
+          for f in out/*.dmg; do
+            echo "attaching $f"
+            gh release upload nightly "$f" --repo "$GITHUB_REPOSITORY" --clobber || true
+          done
+          echo "done attaching macOS dmgs"
