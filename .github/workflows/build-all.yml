@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Builds every desktop platform NectarLink ships, the same way upstream's
-# release pipeline does, plus the macOS preview for both Apple Silicon and
-# Intel. Called by nightly-all.yml (sync -> build -> release). Upstream has no
-# macOS build of its own, so that part lives only here.
+# release pipeline does, plus the macOS preview for Apple Silicon. Called by
+# nightly-all.yml (sync -> build -> release). Upstream has no macOS build of
+# its own, so that part lives only here.
+#
+# NOTE: the Intel (x86_64) macOS build is intentionally NOT here — GitHub's
+# Intel macOS runners are scarce and queue for a long time, so it lives as a
+# decoupled "best-effort, attach later" job in nightly-all.yml that never
+# blocks the other platforms from being published.
 #
 # Reuses upstream's proven Windows/Linux packaging scripts (scripts/,
 # desktop/packaging/linux/). Android is intentionally omitted: it needs a
@@ -182,33 +187,4 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: macos-arm64
-          path: dist/NectarLink-*.dmg
-
-  macos-x86_64:
-    name: macOS app (Intel)
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v7
-        with: { ref: main }
-      - name: Install the pinned Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-        with: { shared-key: mirror-macos-app, save-if: true }
-      - name: Install Qt ${{ env.QT_VERSION }}
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtshadertools
-          cache: true
-          aqtsource: git+https://github.com/miurahr/aqtinstall.git
-      - name: Build the desktop app
-        run: cargo build --release -p nectarlink-desktop
-      - name: Package the .app and .dmg
-        run: bash desktop/packaging/macos/build-app.sh
-      - uses: actions/upload-artifact@v7
-        with:
-          name: macos-x86_64
           path: dist/NectarLink-*.dmg
