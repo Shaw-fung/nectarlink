@@ -65,8 +65,16 @@ if [ -z "$MACDEPLOYQT" ]; then
   exit 1
 fi
 
-echo "==> Running macdeployqt ($MACDEPLOYQT)"
-"$MACDEPLOYQT" "$APP" -qmldir "$REPO/desktop/app/qml" -verbose=1
+# NOTE: macdeployqt requires -qmldir=<path> as a SINGLE argument (with '=').
+# Passing "-qmldir /path" as two args makes it read "-qmldir" alone and fail
+# with "Missing qml directory path".
+if [ ! -d "$REPO/desktop/app/qml" ]; then
+  echo "::warning::qml source dir not found at $REPO/desktop/app/qml; skipping -qmldir scan" >&2
+  "$MACDEPLOYQT" "$APP" -verbose=1
+else
+  echo "==> Running macdeployqt ($MACDEPLOYQT) with qmldir=$REPO/desktop/app/qml"
+  "$MACDEPLOYQT" "$APP" -qmldir="$REPO/desktop/app/qml" -verbose=1
+fi
 
 # Ad-hoc sign so Gatekeeper lets you open it. This is a personal/unofficial
 # build: for wide distribution you would need an Apple Developer ID and
