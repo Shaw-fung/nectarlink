@@ -24,11 +24,9 @@ env:
   CARGO_TERM_COLOR: always
   QT_VERSION: "6.12.0"
 
-# Never let one platform's failure/queue cancel the others. macOS builds live
-# as decoupled best-effort jobs in nightly-all.yml so they can never block the
-# Windows/Linux release.
-fail-fast: false
-
+# Windows/Linux are independent (non-matrix) jobs, so one failing never cancels
+# the other. macOS builds live as decoupled best-effort jobs in nightly-all.yml
+# so they can never block the Windows/Linux release from being published.
 jobs:
   windows-x64:
     name: Windows installer (x64)
