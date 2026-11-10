@@ -122,7 +122,7 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [build]
+    needs: [sync, build]
     if: needs.sync.result == 'success'
     runs-on: ubuntu-latest
     env:
@@ -130,19 +130,22 @@ jobs:
       VERSION: ${{ needs.sync.outputs.version }}
       COMMIT: ${{ needs.sync.outputs.commit }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: files
-          merge-multiple: true
-        continue-on-error: true
+      # Checkout FIRST so its default `git clean` does not wipe the artifact
+      # directory that download-artifact creates right after.
       - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
           fetch-tags: true
+      - uses: actions/download-artifact@v8
+        with:
+          path: files
+          merge-multiple: true
+        continue-on-error: true
       - name: Publish it as a rolling release
         run: |
           set -euo pipefail
+          mkdir -p files
           cd files
 
           # Hash whatever actually landed (platforms that failed to build are
