@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds the macOS preview of NectarLink on GitHub's hosted macOS runner and
+# uploads a signed .app inside a .dmg as a downloadable artifact.
+#
+# Upstream (build.yml) only ships Windows / Linux / Android; macOS is "Preview"
+# and has no official release build yet, so this workflow stands alone and does
+# NOT feed the release or nightly pipelines.
+#
+# Trigger: Actions -> macOS build -> Run workflow. No local compilation needed.
+name: macOS build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the build (leave empty to use Cargo.toml)"
+        required: false
+        default: ""
+  # Optional: also build on every push to main. Keep commented to avoid spending
+  # macOS runner minutes (billed ~10x on GitHub's free tier).
+  # push:
+  #   branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  QT_VERSION: "6.12.0"
+
+jobs:
+  macos:
+    # macos-latest is Apple Silicon (arm64). For Intel Macs, add a second matrix
+    # entry with runs-on: macos-13 (see notes in the README of this kit).
+    name: macOS app (Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-app
+          save-if: true
+
+      - name: Install Qt ${{ env.QT_VERSION }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtshadertools
+          cache: true
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git
+
+      - name: Build the desktop app
+        run: cargo build --release -p nectarlink-desktop
+
+      - name: Package the .app and .dmg
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: bash desktop/packaging/macos/build-app.sh
+
+      - name: Upload the macOS build
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: dist/Nectarlink-*.dmg
+          if-no-files-found: error
