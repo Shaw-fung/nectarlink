@@ -3,19 +3,17 @@
 # the Windows/Linux pipeline so GitHub's scarce macOS runners can never block
 # or hold a lock on the other platforms' release.
 #
-# What it does:
-#   - Builds the Apple Silicon (.dmg) on macos-latest and the Intel (.dmg) on
-#     macos-13, each as its own job with a hard timeout so it can't queue
-#     forever and waste a runner slot reservation.
-#   - Each job is a no-op if its .dmg is already attached to the nightly
-#     release (so we don't burn scarce macOS minutes rebuilding the same thing).
-#   - An attach job uploads whatever .dmg actually got built onto the existing
-#     "nightly" release (gh release upload --clobber).
+# Each job BUILDS AND UPLOADS its own .dmg directly on success — there is no
+# shared "attach" step that waits for the other architecture, so a queued or
+# cancelled Intel build can never block the Apple Silicon .dmg from shipping.
+#
+# Guards: a job is a no-op if its .dmg is already attached to the nightly
+# release (so we don't burn scarce macOS minutes rebuilding the same thing).
 #
 # Triggers:
 #   - workflow_run: right after "Nightly all" finishes publishing.
-#   - schedule: a couple of retry windows later the same day, in case the
-#     macOS runners were still queued the first time.
+#   - schedule: a retry window later the same day, in case the macOS runners
+#     were still queued the first time.
 #   - workflow_dispatch: manual "Run workflow" (force) from the Actions tab.
 name: macOS nightly
 
@@ -25,7 +23,6 @@ on:
     types: [completed]
   schedule:
     - cron: "30 19 * * *"   # ~1.5h after the nightly build, retry window
-    - cron: "30 22 * * *"   # another retry window later the same day
   workflow_dispatch:
     inputs:
       force:
@@ -91,16 +88,24 @@ jobs:
       - name: Package the .app and .dmg
         if: steps.guard.outputs.skip != 'true'
         run: bash desktop/packaging/macos/build-app.sh
-      - uses: actions/upload-artifact@v7
+      - name: Upload the Apple Silicon .dmg to the nightly release
         if: steps.guard.outputs.skip != 'true'
-        with:
-          name: macos-arm64
-          path: dist/NectarLink-*.dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DMG=$(ls dist/NectarLink-*-arm64.dmg 2>/dev/null || true)
+          if [ -n "$DMG" ]; then
+            gh release upload nightly "$DMG" --repo "$GITHUB_REPOSITORY" --clobber || true
+            echo "attached $DMG to nightly"
+          else
+            echo "no arm64 dmg produced; skipping upload"
+          fi
 
   macos-intel:
     name: macOS app (Intel)
     runs-on: macos-13
-    timeout-minutes: 90
+    timeout-minutes: 60
     continue-on-error: true
     env:
       CARGO_TERM_COLOR: always
@@ -147,36 +152,16 @@ jobs:
       - name: Package the .app and .dmg
         if: steps.guard.outputs.skip != 'true'
         run: bash desktop/packaging/macos/build-app.sh
-      - uses: actions/upload-artifact@v7
+      - name: Upload the Intel .dmg to the nightly release
         if: steps.guard.outputs.skip != 'true'
-        with:
-          name: macos-intel
-          path: dist/NectarLink-*.dmg
-
-  attach:
-    name: Attach the .dmg to the nightly release
-    needs: [macos-arm64, macos-intel]
-    if: always()
-    runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dmgs
-          merge-multiple: true
-        continue-on-error: true
-      - name: Upload whatever got built
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p dmgs out
-          find dmgs -type f -name '*.dmg' -exec sh -c 'cp "$1" out/' _ {} \;
-          if [ -z "$(ls -A out 2>/dev/null)" ]; then
-            echo "no macOS dmg produced this run (runners likely still queued); nothing to attach"
-            exit 0
+          DMG=$(ls dist/NectarLink-*-x86_64.dmg 2>/dev/null || true)
+          if [ -n "$DMG" ]; then
+            gh release upload nightly "$DMG" --repo "$GITHUB_REPOSITORY" --clobber || true
+            echo "attached $DMG to nightly"
+          else
+            echo "no intel dmg produced; skipping upload"
           fi
-          for f in out/*.dmg; do
-            echo "attaching $f"
-            gh release upload nightly "$f" --repo "$GITHUB_REPOSITORY" --clobber || true
-          done
-          echo "done attaching macOS dmgs"
