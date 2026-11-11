@@ -82,6 +82,7 @@ import app.nectarlink.android.ui.pairing.PairingScreen
 import app.nectarlink.android.ui.recorder.RecorderScreen
 import app.nectarlink.android.ui.remote.RemoteMode
 import app.nectarlink.android.ui.remote.RemoteScreen
+import app.nectarlink.android.ui.settings.RelaySettingsDialog
 import app.nectarlink.android.ui.settings.SettingsScreen
 import app.nectarlink.android.ui.theme.Appearance
 import app.nectarlink.android.ui.theme.GlassBackdrop
@@ -140,7 +141,9 @@ class MainActivity : ComponentActivity() {
             }.filter { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
             if (wanted.isNotEmpty()) permissions.launch(wanted.toTypedArray())
         }
-        if (savedInstanceState == null) {
+        if (savedInstanceState != null) {
+            pendingPairingLink = savedInstanceState.getString(STATE_PENDING_PAIRING_LINK)
+        } else {
             handlePairingLink(intent)
             handleRemoteIntent(intent)
             handleDeckIntent(intent)
@@ -158,6 +161,9 @@ class MainActivity : ComponentActivity() {
                 } else if (state.status is CoreStatus.Ready) {
                     ConnectionService.stop(this@MainActivity)
                 }
+            }
+            LaunchedEffect(state.ringingPeer) {
+                if (state.ringingPeer != null) startActivity(RingActivity.intent(this@MainActivity))
             }
             NectarlinkTheme(
                 appearance = appearance,
@@ -195,18 +201,26 @@ class MainActivity : ComponentActivity() {
                         val pcName = remember(link) {
                             android.net.Uri.parse(link).getQueryParameter("n")?.trim()?.takeIf { it.isNotEmpty() }
                         } ?: stringResource(R.string.pair_link_unknown_pc)
+                        val clearPending = {
+                            pendingPairingLink = null
+                            if (intent?.action == Intent.ACTION_VIEW) {
+                                setIntent(Intent(this@MainActivity, MainActivity::class.java))
+                            }
+                        }
                         androidx.compose.material3.AlertDialog(
-                            onDismissRequest = { pendingPairingLink = null },
+                            onDismissRequest = clearPending,
                             title = { Text(stringResource(R.string.pair_link_title, pcName)) },
                             text = { Text(stringResource(R.string.pair_link_body)) },
                             confirmButton = {
                                 androidx.compose.material3.TextButton(onClick = {
-                                    pendingPairingLink = null
-                                    core.joinWhenReady(link)
+                                    clearPending()
+                                    if (PairingLinks(this@MainActivity).consume(link)) {
+                                        core.joinWhenReady(link)
+                                    }
                                 }) { Text(stringResource(R.string.pair_link_confirm)) }
                             },
                             dismissButton = {
-                                androidx.compose.material3.TextButton(onClick = { pendingPairingLink = null }) {
+                                androidx.compose.material3.TextButton(onClick = clearPending) {
                                     Text(stringResource(R.string.pair_link_cancel))
                                 }
                             },
@@ -231,8 +245,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_PENDING_PAIRING_LINK, pendingPairingLink)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handlePairingLink(intent)
         handleRemoteIntent(intent)
         handleDeckIntent(intent)
@@ -313,8 +333,12 @@ class MainActivity : ComponentActivity() {
         val link = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
         if (!link.startsWith("nectarlink://pair?")) return
         if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
-        if (!PairingLinks(this).consume(link)) return
+        if (PairingLinks(this).isUsed(link)) return
         pendingPairingLink = link
+    }
+
+    private companion object {
+        const val STATE_PENDING_PAIRING_LINK = "pending_pairing_link"
     }
 }
 
@@ -357,6 +381,7 @@ private fun App(
     var tab by rememberSaveable { mutableStateOf(Tab.Home) }
     var pairing by rememberSaveable { mutableStateOf(false) }
     var manualWalkthroughOpen by rememberSaveable { mutableStateOf(false) }
+    var activeFirstRunWalkthrough by rememberSaveable { mutableStateOf(false) }
     var featuresGuideOpen by rememberSaveable { mutableStateOf(false) }
     var pendingHighlightTarget by rememberSaveable { mutableStateOf<GuideHighlightTarget?>(null) }
     var remotePcId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -369,11 +394,19 @@ private fun App(
     var webcamInitialHeight by rememberSaveable { mutableStateOf<Int?>(null) }
     var webcamInitialCamera by rememberSaveable { mutableStateOf<String?>(null) }
     val walkthroughPersistence by preferences.walkthrough.collectAsStateWithLifecycle()
-    val startupWalkthrough = remember(walkthroughPersistence, state.devices.isNotEmpty()) {
+    val startupWalkthrough = remember(walkthroughPersistence, state.devices.isNotEmpty(), activeFirstRunWalkthrough) {
         resolveStartupWalkthrough(
             persistence = walkthroughPersistence,
             hasPairedDevices = state.devices.isNotEmpty(),
+            walkthroughAlreadyActive = activeFirstRunWalkthrough,
         )
+    }
+    LaunchedEffect(state.status, startupWalkthrough.showWalkthrough, walkthroughPersistence.completed) {
+        if (walkthroughPersistence.completed) {
+            activeFirstRunWalkthrough = false
+        } else if (state.status is CoreStatus.Ready && startupWalkthrough.showWalkthrough) {
+            activeFirstRunWalkthrough = true
+        }
     }
     LaunchedEffect(state.status, startupWalkthrough.markCompletedAutomatically) {
         if (state.status is CoreStatus.Ready && startupWalkthrough.markCompletedAutomatically) {
@@ -578,12 +611,14 @@ private fun App(
                             core.resetPairing()
                             pairing = false
                             manualWalkthroughOpen = false
+                            activeFirstRunWalkthrough = false
                             preferences.updateWalkthrough { it.copy(completed = true) }
                         },
                         onFinishToHome = {
                             core.resetPairing()
                             pairing = false
                             manualWalkthroughOpen = false
+                            activeFirstRunWalkthrough = false
                             tab = Tab.Home
                             preferences.updateWalkthrough {
                                 it.copy(completed = true, currentStepIndex = WalkthroughStep.Done.index)
@@ -593,6 +628,7 @@ private fun App(
                             core.resetPairing()
                             pairing = false
                             manualWalkthroughOpen = false
+                            activeFirstRunWalkthrough = false
                             featuresGuideOpen = true
                             preferences.updateWalkthrough {
                                 it.copy(completed = true, currentStepIndex = WalkthroughStep.Done.index)
@@ -936,6 +972,14 @@ private fun App(
                                 )
                             }
                             Tab.Settings -> saveableStateHolder.SaveableStateProvider("tab_settings") {
+                                var relaySettingsOpen by remember { mutableStateOf(false) }
+                                if (relaySettingsOpen) {
+                                    RelaySettingsDialog(
+                                        core = core,
+                                        awayMode = state.awayMode,
+                                        onDismiss = { relaySettingsOpen = false },
+                                    )
+                                }
                                 SettingsScreen(
                                     state = state,
                                     appearance = appearance,
@@ -976,6 +1020,7 @@ private fun App(
                                     onClearEverything = core::clearEverything,
                                     onToggleLocalSend = core::setLocalSendEnabled,
                                     onToggleAwayMode = core::setAwayMode,
+                                    onOpenRelaySettings = { relaySettingsOpen = true },
                                     onOpenWalkthrough = {
                                         preferences.updateWalkthrough { it.goToStep(WalkthroughStep.Welcome) }
                                         manualWalkthroughOpen = true

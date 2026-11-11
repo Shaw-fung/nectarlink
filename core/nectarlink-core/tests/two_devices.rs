@@ -810,6 +810,33 @@ async fn update_hints_reach_peers_now_and_on_connect() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn local_stop_clears_the_initiators_ring_state() {
+    let mut phone = device("Pixel", DeviceKind::Phone).await;
+    let mut pc = device("Desktop", DeviceKind::Desktop).await;
+    let mut tablet = device("Tablet", DeviceKind::Phone).await;
+    pair_qr(&mut phone, &mut pc).await;
+    pair_qr(&mut phone, &mut tablet).await;
+
+    for target in [&pc, &tablet] {
+        let target_id = target.node.device_id();
+        phone.node.ring(target_id, true).await.unwrap();
+        wait_for(&mut phone, "remote ring started", |event| match event {
+            NodeEvent::RemoteRing { device, on: true } if *device == target_id => Some(()),
+            _ => None,
+        })
+        .await;
+
+        target.node.stop_ringing().await;
+        wait_for(&mut phone, "remote ring stopped", |event| match event {
+            NodeEvent::RemoteRing { device, on: false } if *device == target_id => Some(()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(*target.platform.rings.lock().unwrap(), [true, false]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ring_and_battery_flow_between_devices() {
     let mut pc = device("Desktop", DeviceKind::Desktop).await;
     let mut phone = device("Pixel", DeviceKind::Phone).await;
@@ -1023,6 +1050,7 @@ async fn unpairing_is_mirrored_on_the_other_device() {
     pair_qr(&mut pc, &mut phone).await;
     let pc_id = pc.node.device_id();
 
+    with_timeout("ring before unpair", phone.node.ring(pc_id, true)).await.unwrap();
     with_timeout("unpair", phone.node.unpair(pc_id)).await.unwrap();
     let phone_id = phone.node.device_id();
     wait_for(&mut pc, "device removed", |e| match e {
@@ -1030,6 +1058,7 @@ async fn unpairing_is_mirrored_on_the_other_device() {
         _ => None,
     })
     .await;
+    assert_eq!(*pc.platform.rings.lock().unwrap(), [true, false]);
     assert!(pc.node.paired_devices().unwrap().is_empty());
     assert!(phone.node.paired_devices().unwrap().is_empty());
     assert!(matches!(pc.node.ring(phone_id, true).await, Err(Error::NotPaired)));
@@ -1835,6 +1864,57 @@ async fn media_is_shared_and_controlled_with_consent() {
     .await
     .expect("next");
     assert_eq!(pc.platform.media.lock().unwrap()[0], ("Spotify.exe".to_owned(), MediaAction::Next, None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pc_playback_reaches_both_phones_with_large_artwork() {
+    let mut pc = device("Desktop", DeviceKind::Desktop).await;
+    let mut first = device("Pixel", DeviceKind::Phone).await;
+    let mut second = device("Tablet", DeviceKind::Phone).await;
+    pair_qr(&mut pc, &mut first).await;
+    let pc_id = pc.node.device_id();
+
+    let players = (0..4)
+        .map(|i| {
+            let mut p = player(
+                &format!("player-{i}"),
+                &format!("Video {i}"),
+                Some((&format!("art-{i}"), vec![i; 256 * 1024])),
+            );
+            p.playing = i == 3;
+            p
+        })
+        .collect::<Vec<_>>();
+    pc.node.media_changed(players.clone()).await;
+    let state = wait_for(&mut first, "first phone sees video", media_of(pc_id)).await;
+    assert_eq!(state.len(), 4);
+    assert!(state[3].playing && state[3].art.is_some());
+
+    // The second phone joins after playback started. Use a separate event
+    // subscription so waiting for pairing can't consume its first snapshot.
+    let mut events = second.node.events();
+    pair_qr(&mut pc, &mut second).await;
+    let state = with_timeout("second phone sees the already playing video", async {
+        loop {
+            if let Some(players) = media_of(pc_id)(&events.recv().await.unwrap()) {
+                break players;
+            }
+        }
+    })
+    .await;
+    assert_eq!(state.len(), 4);
+    assert!(state[3].playing && state[3].art.is_some());
+
+    let mut paused = players;
+    paused[3].playing = false;
+    pc.node.media_changed(paused).await;
+    for phone in [&mut first, &mut second] {
+        let state = wait_for(phone, "phone sees the pause", |event| {
+            media_of(pc_id)(event).filter(|players| players.len() == 4 && !players[3].playing)
+        })
+        .await;
+        assert_eq!(state[3].title.as_deref(), Some("Video 3"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3763,6 +3843,39 @@ async fn phone_storage_lists_reads_ranges_writes_resumes_mutates_and_enforces_se
     .unwrap();
     assert_eq!(done.size, payload.len() as u64);
     assert_eq!(std::fs::read(storage_root.path().join("Documents/upload.bin")).unwrap(), payload);
+
+    // If a partial upload is interrupted and the source file's content changes (same size and ID),
+    // the second upload does not splice the stale prefix into the new content.
+    let payload_v1 = data(200 * 1024, 11);
+    let payload_v2 = data(200 * 1024, 22);
+    let changed_file = upload_src.path().join("changed.bin");
+    std::fs::write(&changed_file, &payload_v1).unwrap();
+    let _ = pc
+        .node
+        .storage_write_with_id(
+            phone_id,
+            "Documents/changed.bin",
+            &changed_file,
+            Some("resume-upload-changed".into()),
+            Some(80 * 1024),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::fs::write(&changed_file, &payload_v2).unwrap();
+    with_timeout(
+        "write after content change",
+        pc.node.storage_write_with_id(
+            phone_id,
+            "Documents/changed.bin",
+            &changed_file,
+            Some("resume-upload-changed".into()),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(storage_root.path().join("Documents/changed.bin")).unwrap(), payload_v2);
+    pc.node.storage_delete(phone_id, "Documents/changed.bin", true).await.unwrap();
 
     // `rename` moves the uploaded file into `Projects/renamed.bin`.
     with_timeout(
@@ -7231,6 +7344,93 @@ async fn elevated_over_usb_is_refused_without_a_usb_connection() {
     let bad = phone.node.elevated_usb_start(pc_id, apk, token, vec!["reboot".into()]).await;
     assert!(matches!(bad, Err(Error::Protocol(_))), "{bad:?}");
 
+    pc.node.shutdown().await;
+    phone.node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spoofed_usb_hello_is_not_trusted_without_matching_quic_identity() {
+    use nectarlink_core::{ConnectionPath, DeviceId};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn send_usb_hello(stream: &mut tokio::net::TcpStream, id: &DeviceId, name: &str) {
+        let json = format!(r#"{{"v":1,"id":"{id}","name":"{name}"}}"#);
+        let bytes = json.as_bytes();
+        let mut header = [0u8; 6];
+        header[..4].copy_from_slice(b"NLQU");
+        header[4..6].copy_from_slice(&(bytes.len() as u16).to_be_bytes());
+        stream.write_all(&header).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    async fn read_usb_hello(stream: &mut tokio::net::TcpStream) {
+        let mut header = [0u8; 6];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..4], b"NLQU");
+        let len = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+    }
+
+    let mut phone = start_usb_device("Pixel", DeviceKind::Phone, Some(0), &[]).await;
+    let mut pc = start_usb_device("Desktop", DeviceKind::Desktop, None, &[]).await;
+    pair_qr(&mut pc, &mut phone).await;
+    let (pc_id, phone_id) = (pc.node.device_id(), phone.node.device_id());
+
+    assert!(matches!(
+        phone.node.paired_devices().unwrap()[0].link,
+        LinkState::Online { path: ConnectionPath::Lan, .. }
+    ));
+
+    // 1. Phone side: a local TCP client sends a spoofed UsbHello claiming the paired PC's
+    //    DeviceId (and another claiming an unpaired DeviceId) without completing QUIC TLS.
+    let usb_port = phone.node.usb_port().expect("phone USB TCP listener");
+    let mut spoof_pc = tokio::net::TcpStream::connect(("127.0.0.1", usb_port)).await.unwrap();
+    send_usb_hello(&mut spoof_pc, &pc_id, "Spoofed PC").await;
+    read_usb_hello(&mut spoof_pc).await;
+
+    let fake_id = DeviceId([0x42; 32]);
+    let mut spoof_unpaired = tokio::net::TcpStream::connect(("127.0.0.1", usb_port)).await.unwrap();
+    send_usb_hello(&mut spoof_unpaired, &fake_id, "Spoofed Unpaired").await;
+    read_usb_hello(&mut spoof_unpaired).await;
+
+    // 2. PC side: a local TCP listener replies to connect_usb_tunnel with a spoofed UsbHello
+    //    claiming the paired phone's DeviceId, without forwarding QUIC traffic to the phone.
+    let fake_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let fake_addr = fake_listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let (mut s, _) = fake_listener.accept().await.unwrap();
+        read_usb_hello(&mut s).await;
+        send_usb_hello(&mut s, &phone_id, "Spoofed Phone").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+    let claimed = pc.node.connect_usb_tunnel(fake_addr).await.unwrap();
+    assert_eq!(claimed, phone_id);
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Neither side trusts the unauthenticated UsbHello: links stay on Lan and fake_id is not discovered.
+    assert!(
+        matches!(
+            phone.node.paired_devices().unwrap()[0].link,
+            LinkState::Online { path: ConnectionPath::Lan, .. }
+        ),
+        "phone session must remain on Lan when UsbHello is not backed by QUIC identity"
+    );
+    assert!(
+        matches!(
+            pc.node.paired_devices().unwrap()[0].link,
+            LinkState::Online { path: ConnectionPath::Lan, .. }
+        ),
+        "pc session must remain on Lan when UsbHello is not backed by QUIC identity"
+    );
+    assert!(
+        !phone.node.discovered_devices().iter().any(|d| d.id == fake_id),
+        "unauthenticated UsbHello must not emit or record DiscoveredDevice"
+    );
+
+    server_task.abort();
     pc.node.shutdown().await;
     phone.node.shutdown().await;
 }

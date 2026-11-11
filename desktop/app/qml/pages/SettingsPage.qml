@@ -24,7 +24,8 @@ Item {
         { id: "files_sync", title: qsTr("Files & Sync"), icon: Icons.folder, subtitle: qsTr("Folder sync, storage & recordings") },
         { id: "shortcuts", title: qsTr("Shortcuts & Rules"), icon: Icons.bolt, subtitle: qsTr("Hotkeys & automations") },
         { id: "storage", title: qsTr("Storage & Privacy"), icon: Icons.clipboardList, subtitle: qsTr("History, caches & retention") },
-        { id: "connection", title: qsTr("Connection & About"), icon: Icons.wifi, subtitle: qsTr("Doctor, Wake-on-LAN, API & version") }
+        { id: "connection", title: qsTr("Connection & About"), icon: Icons.wifi, subtitle: qsTr("Doctor, Wake-on-LAN, API & version") },
+        { id: "support", title: qsTr("Support NectarLink"), icon: Icons.heart, subtitle: qsTr("Help keep it going") }
     ]
 
     // The languages the app speaks besides the system's ({ code, name }).
@@ -3338,6 +3339,37 @@ Item {
                                 onToggled: function(v) { Preferences.awayMode = v }
                             }
                         }
+                        Divider { width: parent.width; visible: Qt.platform.os === "linux" }
+                        ListRow {
+                            width: parent.width
+                            visible: Qt.platform.os === "linux"
+                            iconPath: Icons.wifi
+                            title: qsTr("Network interface")
+                            description: qsTr("Local connections switch after a restart. Relays switch right away if the app started with an interface selected.")
+                            Button {
+                                variant: "tonal"
+                                size: "sm"
+                                text: Preferences.networkInterface || qsTr("System default")
+                                onClicked: {
+                                    networkInterfaceSheet.options = JSON.parse(AppController.networkInterfaces())
+                                    networkInterfaceSheet.failed = false
+                                    networkInterfaceSheet.open()
+                                }
+                            }
+                        }
+                        Divider { width: parent.width }
+                        ListRow {
+                            width: parent.width
+                            iconPath: Icons.globe
+                            title: qsTr("Iroh relay servers")
+                            description: qsTr("View active routes, check latency and manage relay servers.")
+                            Button {
+                                variant: "tonal"
+                                size: "sm"
+                                text: qsTr("Manage")
+                                onClicked: relaySheet.open()
+                            }
+                        }
                         Divider { width: parent.width }
                         ListRow {
                             width: parent.width
@@ -3555,6 +3587,32 @@ Item {
                     }
                 }
             }
+
+            // ================================================================
+            // 10. SUPPORT
+            // ================================================================
+            Column {
+                visible: page.currentSection === "support"
+                width: visible ? parent.width : 0
+                spacing: Theme.gutter
+
+                Card {
+                    width: parent.width
+                    ListRow {
+                        width: parent.width
+                        iconPath: Icons.heart
+                        title: qsTr("Support NectarLink")
+                        description: qsTr("NectarLink is free and open source. If it makes your days a little easier, you can help keep it going. Thank you!")
+                        Button {
+                            objectName: "supportButton"
+                            variant: "tonal"
+                            size: "sm"
+                            text: qsTr("Support")
+                            onClicked: Qt.openUrlExternally("https://buymeacoffee.com/thtbee_")
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3741,6 +3799,53 @@ Item {
             }
         }
     }
+
+    Sheet {
+        id: networkInterfaceSheet
+        property var options: []
+        property bool failed: false
+        cardWidth: 420
+
+        Column {
+            width: parent.width
+            spacing: 10
+            Txt { role: "headline"; text: qsTr("Network interface") }
+            Repeater {
+                model: [{ name: "", direct: false }].concat(networkInterfaceSheet.options)
+                delegate: Button {
+                    required property var modelData
+                    width: parent.width
+                    text: modelData.direct ? qsTr("%1 · Direct (without a VPN)").arg(modelData.name)
+                                           : (modelData.name || qsTr("System default"))
+                    variant: modelData.name === Preferences.networkInterface ? "tonal" : "text"
+                    onClicked: {
+                        if (modelData.name === Preferences.networkInterface) {
+                            networkInterfaceSheet.close()
+                            return
+                        }
+                        const result = AppController.selectRelayInterface(modelData.name)
+                        if (result === "failed") {
+                            networkInterfaceSheet.failed = true
+                            return
+                        }
+                        Preferences.networkInterface = modelData.name
+                        networkInterfaceSheet.close()
+                        if (result === "applied")
+                            relaySheet.open()
+                    }
+                }
+            }
+            Txt {
+                width: parent.width
+                wrapMode: Text.Wrap
+                visible: networkInterfaceSheet.failed
+                text: qsTr("Could not use this network interface.")
+            }
+            Button { variant: "text"; text: qsTr("Close"); onClicked: networkInterfaceSheet.close() }
+        }
+    }
+
+    RelaySheet { id: relaySheet }
 
     Sheet {
         id: hotspotSheet

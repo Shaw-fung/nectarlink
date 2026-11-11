@@ -2936,7 +2936,7 @@ async fn run(cli: &Cli, node: &Node) -> Result<()> {
                     let thumbs =
                         node.photo_thumbs(id, ids.clone()).await.context("can't fetch thumbnails")?;
                     for t in thumbs {
-                        let safe = t.id.replace(':', "-");
+                        let safe = t.id.replace([':', '/', '\\'], "-");
                         let path = dir.join(format!("{safe}.jpg"));
                         std::fs::write(&path, &t.data).context("can't write thumbnail")?;
                         println!("{} ({} B) -> {}", t.id, t.data.len(), path.display());
@@ -3959,6 +3959,17 @@ async fn run(cli: &Cli, node: &Node) -> Result<()> {
                             if e.photo.is_some() { " (photo)" } else { "" }
                         );
                     }
+                    match node.call_sims(id).await {
+                        Ok(sims) if sims.sims.is_empty() => println!("SIMs: none listed"),
+                        Ok(sims) => {
+                            for sim in &sims.sims {
+                                let default =
+                                    if sims.default.as_ref() == Some(&sim.id) { " (default)" } else { "" };
+                                println!("SIM: {}{default}", sim.label);
+                            }
+                        }
+                        Err(e) => println!("SIMs: {e}"),
+                    }
                 }
             }
         }
@@ -4783,6 +4794,8 @@ fn print_event(node: &Node, event: &NodeEvent) {
             battery.level,
             if battery.charging { " (charging)" } else { "" }
         ),
+        NodeEvent::RemoteRing { device, on: false } => println!("{}: stopped ringing", name(device)),
+        NodeEvent::RemoteRing { .. } => {}
         NodeEvent::Ring { device, on } => {
             println!("{}: {}", name(device), if *on { "asked us to ring" } else { "stopped ringing" })
         }

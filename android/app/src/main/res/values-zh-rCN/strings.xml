@@ -85,7 +85,7 @@
     <string name="local_network_title">在此网络上访问你的电脑</string>
     <string name="local_network_text">应用与网络中的设备通信前，Android会先询问。NectarLink需要此权限才能访问你的电脑。</string>
     <string name="channel_elevated">无线调试设置</string>
-    <string name="elevated_title">真实触控与按键</string>
+    <string name="elevated_title">高级权限</string>
     <string name="elevated_not_set_up">从电脑实现实时触控、全部按键，以及通话中的静音、保持和拨号盘。</string>
     <string name="elevated_waiting">正在等待无线调试，请在开发者选项中开启。</string>
     <string name="elevated_starting">正在启动…</string>
@@ -233,6 +233,9 @@
     <string name="star_channel">NectarLink 项目</string>
     <string name="star_title">喜欢 NectarLink 吗？</string>
     <string name="star_text">点按前往 GitHub 点星，帮助更多人发现它。</string>
+    <string name="support_title">支持 NectarLink</string>
+    <string name="support_body">NectarLink 免费且开源。如果它让你的日子轻松了一点，可以支持它继续走下去。谢谢！</string>
+    <string name="support_action">支持</string>
     <string name="settings_comb_motion">动态蜂巢</string>
     <string name="settings_comb_motion_hint">蜂巢会呼吸与脉动。开启“移除动画”或省电模式后保持静止。</string>
     <string name="theme_bloom">绽放</string>
@@ -1254,4 +1257,36 @@
     <string name="device_name_in_profile">%1$s（%2$s）</string>
     <string name="profile_work">工作</string>
     <string name="profile_other">第二资料</string>
+
+    <string name="relay_settings_title">Iroh 中继服务器</string>
+    <string name="relay_waiting">正在等待连接服务…</string>
+    <string name="relay_away_hint">开启“通过移动数据连接”后，即可使用已启用的中继服务器。</string>
+    <string name="relay_selection_hint">开关决定 Iroh 可以为此设备选择哪些服务器作为主中继。</string>
+    <string name="relay_home">主中继服务器</string>
+    <string name="relay_home_empty">尚未选择主中继</string>
+    <string name="relay_home_connected">已连接 · %1$s</string>
+    <string name="relay_home_failed">连接失败 · %1$s</string>
+    <string name="relay_home_connecting">正在连接 · %1$s</string>
+    <string name="relay_device_routes">经中继转发的设备流量</string>
+    <string name="relay_routes_empty">当前没有设备通过中继传输流量</string>
+    <string name="relay_route">%1$s 经由 %2$s</string>
+    <string name="relay_check_all">检测所有中继服务器</string>
+    <string name="relay_checking">正在检测中继服务器…</string>
+    <string name="relay_checking_short">正在检测…</string>
+    <string name="relay_not_checked">尚未检测</string>
+    <string name="relay_rtt">%1$d 毫秒</string>
+    <string name="relay_timed_out">超时</string>
+    <string name="relay_unreachable">无法连接</string>
+    <string name="relay_address">自定义中继地址</string>
+    <string name="relay_add">添加中继</string>
+    <string name="relay_enable">启用 %1$s</string>
+    <string name="relay_invalid_address">请输入不含凭据、路径或查询参数的 HTTP 或 HTTPS 中继地址。</string>
+    <string name="relay_duplicate">此中继服务器已在列表中。</string>
+    <string name="relay_limit">最多可添加 16 个自定义中继服务器。</string>
+    <string name="relay_save_failed">无法保存中继设置。</string>
+    <string name="relay_region_na_east">北美东部</string>
+    <string name="relay_region_na_west">北美西部</string>
+    <string name="relay_region_europe">欧洲</string>
+    <string name="relay_region_asia_pacific">亚太地区</string>
+    <string name="relay_region_custom">自定义</string>
 </resources>

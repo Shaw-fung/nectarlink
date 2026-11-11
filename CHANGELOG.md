@@ -8,6 +8,18 @@ change things that need a step from you, and its notes say so.
 
 ### New
 
+- **Support NectarLink.** If you'd like to help keep it going, Settings has a Support
+  section on the phone and the PC, and the "Enjoying NectarLink?" prompt has a Support
+  button next to Star on GitHub. It only opens the page when you tap it.
+- **Choose and check relay servers.** Settings on the PC and the phone lists the relay
+  servers used away from home, shows which one each device goes through, checks how fast
+  they answer, and takes your own. Thanks to [@krakotay](https://github.com/krakotay)
+  ([#324](https://github.com/thtbee/nectarlink/pull/324)).
+- **Pick the network interface relays use, on Linux.** Settings › Connection & About can
+  send relay connections through one interface, like the one past a VPN that's always on.
+  Thanks to [@krakotay](https://github.com/krakotay)
+  ([#331](https://github.com/thtbee/nectarlink/pull/331)).
+- **Keep a mirror window on top.** A pin button in the window's controls keeps it above other windows. Thanks to [@Nebhay](https://github.com/Nebhay) ([#327](https://github.com/thtbee/nectarlink/pull/327)).
 - **Spanish.** NectarLink is available in Spanish on Android and Windows.
   Thanks to José María Garcia Dominguez, and to
   [@KevinL50-sysadmin](https://github.com/KevinL50-sysadmin) for a review pass on it.
@@ -91,6 +103,21 @@ change things that need a step from you, and its notes say so.
 
 ### Fixed
 
+- **Find device stops everywhere.** The button on the device that started the alarm resets when it's stopped on the other one, and a phone shows a full-screen Stop. PC playback also reaches every connected phone, in order. Thanks to [@krakotay](https://github.com/krakotay) ([#326](https://github.com/thtbee/nectarlink/pull/326)).
+- **Phone storage in File Explorer kept showing files deleted on the phone.** They're now removed when the phone's folder is read again. Files you added on the PC that haven't reached the phone stay ([#328](https://github.com/thtbee/nectarlink/issues/328)).
+- **On Linux, starting at login opened the window.** The app is started minimized there, but
+  the window never saw that. Thanks to [@c4g7-dev](https://github.com/c4g7-dev) for finding
+  why ([#336](https://github.com/thtbee/nectarlink/issues/336)).
+- **A mirrored phone could scroll by itself from a Linux PC.** The app took any joystick
+  device for a game controller, a laptop's motion sensor too, and sent its tilt to the
+  phone as a held stick. Only real controllers count now
+  ([#332](https://github.com/thtbee/nectarlink/issues/332)).
+- **"Call with" didn't show for phones with two SIMs.** On newer Android the phone
+  couldn't list its SIMs, so the PC never offered the choice
+  ([#334](https://github.com/thtbee/nectarlink/issues/334)).
+- **Phone as speaker could play the PC's sound twice on the phone.** It now leaves NectarLink's own sound out only while NectarLink is playing a phone's sound ([#281](https://github.com/thtbee/nectarlink/issues/281)).
+- **The PC app's album art cache no longer grows without limit.** It kept every cover of everything played on the PC (166 MB after a month on one PC), and now keeps the newest 90.
+- **The Elevated card on the phone is titled Elevated.** That's the name the guide, the setup and every hint use. It was titled "Real touch and keys", so people looking for Elevated couldn't find it ([#136](https://github.com/thtbee/nectarlink/issues/136)).
 - **"Quiet while this PC is locked" now works on macOS.** The switch was there,
   but the app never found out whether the screen was locked, so pop-ups kept
   coming while the Mac was locked. Thanks to

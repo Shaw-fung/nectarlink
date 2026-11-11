@@ -3,7 +3,7 @@
 //! control stream, request/response correlation and the heartbeat.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -168,18 +168,19 @@ pub(crate) struct Session {
     /// Who opened the connection; used to resolve duplicate connections.
     pub dialer: DeviceId,
     pub conn: Connection,
+    pub(crate) ring_command: tokio::sync::Mutex<()>,
     outbox: mpsc::Sender<Envelope>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Envelope>>>,
     next_id: AtomicU64,
     rtt_ms: AtomicU32,
     pub(crate) started: Instant,
     last_rx_ms: AtomicU64,
-    usb_bridge_ports: Arc<Mutex<std::collections::HashSet<u16>>>,
+    usb_bridge_ports: Arc<Mutex<HashMap<u16, DeviceId>>>,
     usb_peers: Arc<Mutex<HashMap<DeviceId, (std::net::SocketAddr, CancellationToken)>>>,
     /// Apps whose notification icon this peer already got.
     sent_icons: crate::notifications::SentIcons,
-    /// Artwork keys sent to this device (docs/protocol/media.md).
-    sent_art: crate::notifications::SentIcons,
+    /// Serializes media snapshots and remembers the artwork queued for this device.
+    pub(crate) sent_art: tokio::sync::Mutex<HashSet<String>>,
     /// This peer asked for no notifications for now. Ends with the session: a
     /// PC that's still locked says so again when it reconnects.
     notifications_held: std::sync::atomic::AtomicBool,
@@ -218,6 +219,7 @@ impl Session {
             peer,
             dialer,
             conn,
+            ring_command: Default::default(),
             outbox,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -272,11 +274,38 @@ impl Session {
 
     fn is_usb_addr(&self, addr: &std::net::SocketAddr) -> bool {
         addr.ip().to_canonical().is_loopback()
-            && self.usb_bridge_ports.lock().unwrap_or_else(|e| e.into_inner()).contains(&addr.port())
+            && self.usb_bridge_ports.lock().unwrap_or_else(|e| e.into_inner()).get(&addr.port())
+                == Some(&self.peer)
     }
 
     fn has_usb_tunnel(&self) -> bool {
         self.usb_peers.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&self.peer)
+    }
+
+    pub(crate) fn uses_usb_bridge_port(&self, port: u16) -> bool {
+        self.usb_peers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.peer)
+            .is_some_and(|(addr, _)| addr.port() == port)
+            || self.conn.paths().iter().any(|p| {
+                matches!(
+                    p.remote_addr(),
+                    iroh::TransportAddr::Ip(addr) if addr.port() == port && self.is_usb_addr(addr)
+                )
+            })
+    }
+
+    pub(crate) fn relay_url(&self) -> Option<iroh::RelayUrl> {
+        if self.has_usb_tunnel() {
+            return None;
+        }
+        let paths = self.conn.paths();
+        let path = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
+        match path.remote_addr() {
+            iroh::TransportAddr::Relay(url) => Some(url.clone()),
+            _ => None,
+        }
     }
 
     /// The path the connection currently uses.
@@ -327,10 +356,6 @@ impl Session {
 
     pub(crate) fn hold_notifications(&self, held: bool) {
         self.notifications_held.store(held, Ordering::Relaxed);
-    }
-
-    pub(crate) fn sent_art(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
-        self.sent_art.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn is_alive(&self) -> bool {
@@ -401,14 +426,14 @@ impl Session {
         self.cancel.cancel();
     }
 
-    fn complete(&self, env: Envelope) -> bool {
-        let Some(re) = env.re else { return false };
+    fn complete(&self, env: Envelope) -> std::result::Result<(), Envelope> {
+        let Some(re) = env.re else { return Err(env) };
         match self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&re) {
             Some(tx) => {
                 let _ = tx.send(env);
-                true
+                Ok(())
             }
-            None => false,
+            None => Err(env),
         }
     }
 }
@@ -481,9 +506,14 @@ async fn reader(session: &Arc<Session>, mut recv: RecvStream, shared: &Weak<Shar
                 continue;
             }
         };
-        if env.re.is_some() && session.complete(env.clone()) {
-            continue;
-        }
+        let env = if env.re.is_some() {
+            match session.complete(env) {
+                Ok(()) => continue,
+                Err(env) => env,
+            }
+        } else {
+            env
+        };
         let Some(shared) = shared.upgrade() else { return };
         if is_background_rpc(&env.t) {
             // Waiting for a slot would hold up heartbeats behind slow
@@ -517,8 +547,7 @@ async fn reader(session: &Arc<Session>, mut recv: RecvStream, shared: &Weak<Shar
 fn is_background_rpc(t: &str) -> bool {
     matches!(
         t,
-        types::DEVICE_RING
-            | types::NOTIFY_DISMISS
+        types::NOTIFY_DISMISS
             | types::NOTIFY_ACTION
             | types::PC_POWER
             | types::LINK_OPEN
@@ -540,6 +569,7 @@ fn is_background_rpc(t: &str) -> bool {
             | types::STORAGE_MKDIR
             | types::STORAGE_RENAME
             | types::STORAGE_DELETE
+            | types::WAKE_RELAY
     )
 }
 
@@ -595,22 +625,21 @@ async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: Envelope) -> 
         }
         types::DEVICE_RING => {
             let ring: Ring = env.body()?;
-            let platform = shared.platform.clone();
-            let on = ring.on;
-            let _ = tokio::task::spawn_blocking(move || {
-                if on {
-                    platform.start_ringing();
-                } else {
-                    platform.stop_ringing();
-                }
-            })
-            .await;
-            shared.emit(NodeEvent::Ring { device: peer, on: ring.on });
+            shared.receive_ring(session, ring).await;
             session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
+        }
+        types::DEVICE_RING_STOPPED => {
+            let stopped: RingStopped = env.body()?;
+            shared.clear_remote_ring(peer, Some(stopped.token));
         }
         types::PAIR_REVOKE => {
             tracing::info!(peer = %peer.short(), "peer unpaired this device");
-            shared.forget_peer(&peer).await?;
+            // Forgetting the peer closes this session before its cleanup finishes.
+            // Keep the cleanup alive when closing the session drops the reader.
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.forget_peer(&peer).await })
+                .await
+                .map_err(|err| Error::Internal(err.to_string()))??;
         }
         t if t.starts_with("notify.") && crate::notifications::handle(shared, session, &env).await? => {}
         t if t.starts_with("media.") && crate::media::handle(shared, session, &env).await? => {}
@@ -636,20 +665,27 @@ async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: Envelope) -> 
             && crate::transfer::handle_control(shared, peer, &env).await? => {}
         types::WAKE_RELAY => {
             let req = env.body::<WakeRelay>().ok();
-            // Only for a PC paired with this device, by an address it gave as its own.
-            let info = req.as_ref().and_then(|r| known_wake_info(shared, &r.mac));
-            let known = info.is_some();
-            if let (Some(req), Some(info)) = (req, info) {
-                // Only to a subnet that PC gave as its own; anything else goes
-                // to this network's broadcast, never to an address a peer picks.
-                let bcast = req
-                    .broadcast
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|b| info.broadcasts.iter().any(|own| own.trim() == *b))
-                    .and_then(|b| b.parse().ok());
-                let _ = wake::send_magic_packet(req.mac, bcast);
-            } else {
+            let shared_clone = shared.clone();
+            let known = tokio::task::spawn_blocking(move || {
+                // Only for a PC paired with this device, by an address it gave as its own.
+                let info = req.as_ref().and_then(|r| known_wake_info(&shared_clone, &r.mac));
+                let known = info.is_some();
+                if let (Some(req), Some(info)) = (req, info) {
+                    // Only to a subnet that PC gave as its own; anything else goes
+                    // to this network's broadcast, never to an address a peer picks.
+                    let bcast = req
+                        .broadcast
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| info.broadcasts.iter().any(|own| own.trim() == *b))
+                        .and_then(|b| b.parse().ok());
+                    let _ = wake::send_magic_packet(req.mac, bcast);
+                }
+                known
+            })
+            .await
+            .unwrap_or(false);
+            if !known {
                 tracing::debug!(peer = %peer.short(), "refusing to wake an address no paired PC gave");
             }
             if env.id.is_some() {
@@ -663,7 +699,8 @@ async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: Envelope) -> 
         }
         types::AUDIO_PCM => {
             // A rate or layout out of range would play at the wrong speed: dropped.
-            if let Ok(frame) = env.body::<AudioPcmFrame>()
+            if shared.toggle_on(&peer, crate::media::TOGGLE)
+                && let Ok(frame) = env.body::<AudioPcmFrame>()
                 && pcm_frame_ok(frame.sample_rate, frame.channels, frame.pcm.len())
             {
                 shared.emit(NodeEvent::PcAudioFrame {
@@ -716,7 +753,9 @@ async fn datagrams(session: &Arc<Session>, shared: &Weak<Shared>) {
                     let sample_rate = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
                     let channels = bytes[8];
                     let pcm = bytes[10..].to_vec();
-                    if pcm_frame_ok(sample_rate, channels, pcm.len()) {
+                    if shared.toggle_on(&session.peer, crate::media::TOGGLE)
+                        && pcm_frame_ok(sample_rate, channels, pcm.len())
+                    {
                         shared.emit(NodeEvent::PcAudioFrame {
                             device: session.peer,
                             sample_rate,

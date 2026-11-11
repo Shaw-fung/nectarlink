@@ -350,7 +350,7 @@ impl Reporter {
     }
 }
 
-static PHOTO_TRANSFERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+static PHOTO_TRANSFERS: std::sync::Mutex<Option<std::collections::HashMap<String, Instant>>> =
     std::sync::Mutex::new(None);
 
 /// Marks an incoming transfer ID as a requested photo transfer (`photos.get`).
@@ -358,26 +358,28 @@ pub(crate) fn mark_photo_transfer(shared: &Shared, transfer_id: &str) {
     if shared.store.update_timeline_kind_by_ref(transfer_id, crate::TimelineKind::Photo).unwrap_or(false) {
         shared.emit(NodeEvent::TimelineChanged);
     } else {
-        PHOTO_TRANSFERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(std::collections::HashSet::new)
-            .insert(transfer_id.to_owned());
+        let now = Instant::now();
+        let mut guard = PHOTO_TRANSFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        map.retain(|_, t| now.duration_since(*t) < RETRY_FOR);
+        map.insert(transfer_id.to_owned(), now);
     }
 }
 
-static QUIET_TRANSFERS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+static QUIET_TRANSFERS: std::sync::Mutex<Option<std::collections::HashMap<String, Instant>>> =
     std::sync::Mutex::new(None);
 
 /// Marks an incoming transfer as quiet: it's saved like any other, but leaves
 /// nothing in the Timeline (a photo backup's downloads). An entry already
 /// recorded for it (the transfer finished before this) is removed.
 pub(crate) fn mark_quiet_transfer(shared: &Shared, transfer_id: &str) {
-    QUIET_TRANSFERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(std::collections::HashSet::new)
-        .insert(transfer_id.to_owned());
+    let now = Instant::now();
+    {
+        let mut guard = QUIET_TRANSFERS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(std::collections::HashMap::new);
+        map.retain(|_, t| now.duration_since(*t) < RETRY_FOR);
+        map.insert(transfer_id.to_owned(), now);
+    }
     if shared.store.delete_timeline_by_ref(transfer_id).unwrap_or(false) {
         // It had finished already, so nothing will take the mark.
         take_quiet_transfer(transfer_id);
@@ -388,19 +390,19 @@ pub(crate) fn mark_quiet_transfer(shared: &Shared, transfer_id: &str) {
 /// Whether a transfer that just finished was quiet, forgetting it. A failed
 /// one stays marked: it resumes under the same ID.
 fn take_quiet_transfer(transfer_id: &str) -> bool {
-    QUIET_TRANSFERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .is_some_and(|set| set.remove(transfer_id))
+    let now = Instant::now();
+    QUIET_TRANSFERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|map| {
+        map.retain(|_, t| now.duration_since(*t) < RETRY_FOR);
+        map.remove(transfer_id).is_some()
+    })
 }
 
 fn take_photo_transfer(transfer_id: &str) -> bool {
-    PHOTO_TRANSFERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_mut()
-        .is_some_and(|set| set.remove(transfer_id))
+    let now = Instant::now();
+    PHOTO_TRANSFERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|map| {
+        map.retain(|_, t| now.duration_since(*t) < RETRY_FOR);
+        map.remove(transfer_id).is_some()
+    })
 }
 
 pub(crate) fn transfer_timeline_title(names: &[String]) -> String {
@@ -548,22 +550,25 @@ async fn enqueue_outgoing(
         let clean_name = safe_file_name(&file.name);
         match file.source {
             FileSource::Path(path) => {
-                let opened_file = match std::fs::File::open(&path) {
-                    Ok(f) => f,
-                    Err(e) => {
+                let path_for_meta = path.clone();
+                let meta_res = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, i64)> {
+                    let opened_file = std::fs::File::open(&path_for_meta)?;
+                    let meta = opened_file.metadata()?;
+                    Ok((meta.len(), crate::file_mtime_ms(&meta)))
+                })
+                .await
+                .map_err(|e| Error::Internal(e.to_string()));
+                let (size, mtime_ms) = match meta_res {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         cleanup_staging_id(shared, &id);
                         return Err(e.into());
                     }
-                };
-                let meta = match opened_file.metadata() {
-                    Ok(m) => m,
                     Err(e) => {
                         cleanup_staging_id(shared, &id);
-                        return Err(e.into());
+                        return Err(e);
                     }
                 };
-                let size = meta.len();
-                let mtime_ms = crate::file_mtime_ms(&meta);
                 specs.push(crate::QueuedFileSpec {
                     path,
                     name: clean_name.clone(),
@@ -757,16 +762,25 @@ pub(crate) async fn deliver_queued_files(
         return;
     }
 
-    for spec in &specs {
-        if let Err(reason) = spec.verify_integrity() {
-            let _ = shared.store.mark_queue_failed(&item.id, &reason);
-            shared.emit(NodeEvent::QueueChanged);
-            let mut t = transfer;
-            t.state = TransferState::Failed(TransferFailure::Other(reason));
-            shared.emit(NodeEvent::Transfer(t));
-            shared.unregister_transfer(&item.id);
-            return;
+    let specs_to_verify = specs.clone();
+    let verify_err = tokio::task::spawn_blocking(move || {
+        for spec in &specs_to_verify {
+            if let Err(reason) = spec.verify_integrity() {
+                return Some(reason);
+            }
         }
+        None
+    })
+    .await
+    .unwrap_or_else(|e| Some(e.to_string()));
+    if let Some(reason) = verify_err {
+        let _ = shared.store.mark_queue_failed(&item.id, &reason);
+        shared.emit(NodeEvent::QueueChanged);
+        let mut t = transfer;
+        t.state = TransferState::Failed(TransferFailure::Other(reason));
+        shared.emit(NodeEvent::Transfer(t));
+        shared.unregister_transfer(&item.id);
+        return;
     }
 
     let toggle = if recording { RECORDINGS_TOGGLE } else { TOGGLE };
@@ -794,10 +808,19 @@ pub(crate) async fn deliver_queued_files(
                 source_targets.push(target);
             }
         }
-        let handle = match std::fs::File::open(path) {
-            Ok(h) => h,
-            Err(_) => {
-                let reason = format!("File was deleted before sending: {}", spec.name);
+        let path_to_hash = path.clone();
+        let name_for_err = spec.name.clone();
+        let res = tokio::task::spawn_blocking(move || -> std::result::Result<(u64, String), String> {
+            let handle = std::fs::File::open(&path_to_hash)
+                .map_err(|_| format!("File was deleted before sending: {name_for_err}"))?;
+            let (_handle, size, digest) =
+                hash_whole_file(handle).map_err(|_| format!("Cannot read source file: {name_for_err}"))?;
+            Ok((size, digest))
+        })
+        .await;
+        let (size, digest) = match res {
+            Ok(Ok(v)) => v,
+            Ok(Err(reason)) => {
                 let _ = shared.store.mark_queue_failed(&item.id, &reason);
                 shared.emit(NodeEvent::QueueChanged);
                 let mut t = transfer;
@@ -806,13 +829,8 @@ pub(crate) async fn deliver_queued_files(
                 shared.unregister_transfer(&item.id);
                 return;
             }
-        };
-        let name_for_err = spec.name.clone();
-        let res = tokio::task::spawn_blocking(move || hash_whole_file(handle)).await;
-        let (handle, size, digest) = match res {
-            Ok(Ok(v)) => v,
-            _ => {
-                let reason = format!("Cannot read source file: {name_for_err}");
+            Err(_) => {
+                let reason = format!("Cannot read source file: {}", spec.name);
                 let _ = shared.store.mark_queue_failed(&item.id, &reason);
                 shared.emit(NodeEvent::QueueChanged);
                 let mut t = transfer;
@@ -828,7 +846,7 @@ pub(crate) async fn deliver_queued_files(
             folder: spec.folder.clone(),
             blake3: Some(digest),
         };
-        opened.push((entry, tokio::fs::File::from_std(handle)));
+        opened.push((entry, OutgoingDataSource::Path(path.clone())));
     }
 
     let entries: Vec<FileEntry> = opened.iter().map(|(e, _)| e.clone()).collect();
@@ -1055,22 +1073,33 @@ async fn send_inner(
         if file.folder.as_deref().is_some_and(|f| !is_valid_folder(f)) {
             return Err(Error::Protocol("invalid folder name".into()));
         }
-        let handle = match file.source {
+        let (size, digest, data_source) = match file.source {
             FileSource::Path(path) => {
                 let target = outgoing_target_path(&path, file.folder.as_deref());
                 if !source_targets.contains(&target) {
                     source_targets.push(target);
                 }
-                std::fs::File::open(path)?
+                let path_to_hash = path.clone();
+                let (size, digest) =
+                    tokio::task::spawn_blocking(move || -> std::io::Result<(u64, String)> {
+                        let handle = std::fs::File::open(&path_to_hash)?;
+                        let (_handle, size, digest) = hash_whole_file(handle)?;
+                        Ok((size, digest))
+                    })
+                    .await
+                    .map_err(|e| Error::Internal(e.to_string()))??;
+                (size, digest, OutgoingDataSource::Path(path))
             }
-            FileSource::File(handle) => handle,
+            FileSource::File(handle) => {
+                let (handle, size, digest) = tokio::task::spawn_blocking(move || hash_whole_file(handle))
+                    .await
+                    .map_err(|e| Error::Internal(e.to_string()))??;
+                (size, digest, OutgoingDataSource::File(tokio::fs::File::from_std(handle)))
+            }
         };
-        let (handle, size, digest) = tokio::task::spawn_blocking(move || hash_whole_file(handle))
-            .await
-            .map_err(|e| Error::Internal(e.to_string()))??;
         let entry =
             FileEntry { name: safe_file_name(&file.name), size, folder: file.folder, blake3: Some(digest) };
-        opened.push((entry, tokio::fs::File::from_std(handle)));
+        opened.push((entry, data_source));
     }
     let entries: Vec<FileEntry> = opened.iter().map(|(entry, _)| entry.clone()).collect();
     let id = new_id();
@@ -1128,6 +1157,11 @@ async fn send_inner(
     let mut reporter = Reporter::new(shared.clone(), transfer);
     reporter.set(TransferState::Waiting);
     tokio::spawn(async move {
+        if is_photo {
+            // Let the `photos.sending` reply go out on the control stream first
+            // so the requester can tag the transfer ID before it finishes.
+            tokio::task::yield_now().await;
+        }
         let state = send_until_done(&mut reporter, opened, &cancel, &mut pause_rx).await;
         if matches!(state, TransferState::Done { .. }) {
             let _ = reporter.shared.record_timeline(crate::timeline::NewTimelineEntry {
@@ -1150,6 +1184,16 @@ async fn send_inner(
     Ok(id)
 }
 
+enum OutgoingDataSource {
+    Path(PathBuf),
+    File(tokio::fs::File),
+}
+
+enum ReadSource {
+    Path(PathBuf),
+    File(std::fs::File),
+}
+
 enum Attempt {
     Done,
     Cancelled,
@@ -1161,7 +1205,7 @@ enum Attempt {
 
 async fn send_until_done(
     reporter: &mut Reporter,
-    mut files: Vec<(FileEntry, tokio::fs::File)>,
+    mut files: Vec<(FileEntry, OutgoingDataSource)>,
     cancel: &CancellationToken,
     pause_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> TransferState {
@@ -1254,7 +1298,7 @@ async fn wait_paused(rx: &mut tokio::sync::watch::Receiver<bool>) {
 async fn attempt(
     reporter: &mut Reporter,
     session: &Session,
-    files: &mut [(FileEntry, tokio::fs::File)],
+    files: &mut [(FileEntry, OutgoingDataSource)],
     cancel: &CancellationToken,
     pause_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Attempt {
@@ -1306,12 +1350,18 @@ async fn attempt(
     // What's left of each file, read on a thread of its own that keeps a
     // few blocks ready; it stops when this attempt ends and drops them.
     let mut plan = Vec::with_capacity(files.len());
-    for ((entry, file), have) in files.iter().zip(&have) {
+    for ((entry, source), have) in files.iter().zip(&have) {
         let start = (*have).min(entry.size);
-        let Ok(clone) = file.try_clone().await else {
-            return Attempt::Fatal(TransferFailure::Other("can't read a file".into()));
+        let read_source = match source {
+            OutgoingDataSource::Path(path) => ReadSource::Path(path.clone()),
+            OutgoingDataSource::File(file) => {
+                let Ok(clone) = file.try_clone().await else {
+                    return Attempt::Fatal(TransferFailure::Other("can't read a file".into()));
+                };
+                ReadSource::File(clone.into_std().await)
+            }
         };
-        plan.push((clone.into_std().await, start, entry.size - start));
+        plan.push((read_source, start, entry.size - start));
     }
     let (blocks, mut ready) = tokio::sync::mpsc::channel(READ_AHEAD);
     tokio::task::spawn_blocking(move || read_ahead(plan, &blocks));
@@ -1578,7 +1628,7 @@ async fn refuse(send: &mut SendStream, code: ErrorCode, msg: &str) {
 
 /// A file's size and BLAKE3 digest (hex), read from the start; the file is
 /// handed back rewound, ready to send.
-fn hash_whole_file(mut f: std::fs::File) -> std::io::Result<(std::fs::File, u64, String)> {
+pub(crate) fn hash_whole_file(mut f: std::fs::File) -> std::io::Result<(std::fs::File, u64, String)> {
     use std::io::{Seek, SeekFrom};
     let size = f.metadata()?.len();
     f.seek(SeekFrom::Start(0))?;
@@ -1787,6 +1837,8 @@ async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendStream, mut 
         },
         Err(state) => {
             if state == TransferState::Cancelled {
+                let _ = take_photo_transfer(&offer.id);
+                let _ = take_quiet_transfer(&offer.id);
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 if let Some(parent) = dir.parent() {
                     let _ = tokio::fs::remove_dir(parent).await;
@@ -1809,10 +1861,23 @@ async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendStream, mut 
 /// Reads each file's remaining bytes, from where the receiver is, in
 /// blocks; stops early when the sending side is gone.
 fn read_ahead(
-    plan: Vec<(std::fs::File, u64, u64)>,
+    plan: Vec<(ReadSource, u64, u64)>,
     blocks: &tokio::sync::mpsc::Sender<std::result::Result<Bytes, TransferFailure>>,
 ) {
-    for (file, mut at, mut left) in plan {
+    for (source, mut at, mut left) in plan {
+        // Read by position (never through a shared cursor): an older attempt's
+        // reader may still hold the same open file.
+        let file = match source {
+            ReadSource::Path(path) => match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let failure = TransferFailure::Other(format!("can't read a file: {}", e.kind()));
+                    let _ = blocks.blocking_send(Err(failure));
+                    return;
+                }
+            },
+            ReadSource::File(f) => f,
+        };
         while left > 0 {
             let mut block = vec![0u8; BLOCK.min(usize::try_from(left).unwrap_or(usize::MAX))];
             if let Err(e) = read_exact_at(&file, &mut block, at) {
@@ -2119,7 +2184,7 @@ pub(crate) fn mark_from_elsewhere(path: &Path) {
 }
 
 /// Room kept free beyond an incoming transfer's size.
-const SPACE_MARGIN: u64 = 64 * 1024 * 1024;
+pub(crate) const SPACE_MARGIN: u64 = 64 * 1024 * 1024;
 
 /// Bytes free for this user on the drive holding `path` (`None` when it
 /// can't tell, which never blocks a transfer).
@@ -2191,6 +2256,15 @@ pub(crate) fn clean_incoming(dir: &Path) {
             let _ = std::fs::remove_dir(&path);
             continue;
         }
+        if peer.file_name() == "localsend" {
+            for session in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+                if is_stale(&session) {
+                    let _ = std::fs::remove_dir_all(session.path());
+                }
+            }
+            let _ = std::fs::remove_dir(&path);
+            continue;
+        }
         // Transfers from before they were kept per peer: `incoming/<offer>`.
         if peer.file_name().to_str().and_then(|n| n.parse::<DeviceId>().ok()).is_none() {
             if is_stale(&peer) {
@@ -2226,7 +2300,8 @@ mod tests {
         let want = data.len() as u64 - start;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let reader = std::thread::spawn(move || read_ahead(vec![(clone, start, want)], &tx));
+        let reader =
+            std::thread::spawn(move || read_ahead(vec![(ReadSource::File(clone), start, want)], &tx));
         let mut got = Vec::new();
         while let Some(block) = rx.blocking_recv() {
             got.extend_from_slice(&block.expect("reads to the end"));
@@ -2303,6 +2378,38 @@ mod tests {
         std::fs::remove_file(&fresh).unwrap();
         clean_incoming(dir.path());
         assert!(!dir.path().join("storage").exists(), "emptied folders go");
+
+        let ls = dir.path().join("localsend");
+        let ls_fresh = ls.join("lss_fresh");
+        let ls_stale = ls.join("lss_stale");
+        std::fs::create_dir_all(&ls_fresh).unwrap();
+        std::fs::create_dir_all(&ls_stale).unwrap();
+        std::fs::File::options().write(true).open(&ls_stale).ok();
+        let _ = filetime_backdate_dir(&ls_stale, old);
+        clean_incoming(dir.path());
+        assert!(ls_fresh.exists(), "a recent LocalSend session stays intact");
+        std::fs::remove_dir_all(&ls_fresh).unwrap();
+        std::fs::remove_dir_all(&ls_stale).ok();
+        clean_incoming(dir.path());
+        assert!(!ls.exists(), "emptied localsend folder goes");
+    }
+
+    fn filetime_backdate_dir(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)?;
+            f.set_modified(time)
+        }
+        #[cfg(not(windows))]
+        {
+            let f = std::fs::File::open(path)?;
+            f.set_modified(time)
+        }
     }
 
     #[test]
@@ -2377,5 +2484,23 @@ mod tests {
     fn ids_are_valid() {
         assert!(nectarlink_protocol::messages::is_valid_transfer_id(&new_id()));
         assert_ne!(new_id(), new_id());
+    }
+
+    #[test]
+    fn read_ahead_opens_paths_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.bin");
+        let b = dir.path().join("b.bin");
+        std::fs::write(&a, b"hello ").unwrap();
+        std::fs::write(&b, b"world").unwrap();
+        let plan = vec![(ReadSource::Path(a), 0, 6), (ReadSource::Path(b), 0, 5)];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        read_ahead(plan, &tx);
+        drop(tx);
+        let mut out = Vec::new();
+        while let Some(block) = rx.blocking_recv() {
+            out.extend_from_slice(&block.unwrap());
+        }
+        assert_eq!(out, b"hello world");
     }
 }

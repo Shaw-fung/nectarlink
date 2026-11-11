@@ -614,6 +614,10 @@ pub enum Event {
         id: String,
         on: bool,
     },
+    RemoteRing {
+        id: String,
+        on: bool,
+    },
     Discovered {
         device: DiscoveredDevice,
     },
@@ -2387,6 +2391,27 @@ fn file_to_send(file: FileToSend) -> Result<core::OutgoingFile> {
     })
 }
 
+/// Converts every item first so all valid descriptors are owned by `File` (and
+/// closed on drop) even when one item or a later check fails.
+fn files_to_send(files: Vec<FileToSend>) -> Result<Vec<core::OutgoingFile>> {
+    let mut out = Vec::with_capacity(files.len());
+    let mut first_err: Option<NectarlinkError> = None;
+    for f in files {
+        match file_to_send(f) {
+            Ok(outgoing) => out.push(outgoing),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+    Ok(out)
+}
+
 fn upgrade(u: core::features::Upgrade) -> Upgrade {
     let (action, target) = u.action.describe();
     Upgrade { action: action.into(), target, minutes: u.effort.minutes() }
@@ -2430,6 +2455,7 @@ impl Event {
                 Event::Battery { id: device.to_string(), battery: battery.into() }
             }
             NodeEvent::Ring { device, on } => Event::Ring { id: device.to_string(), on },
+            NodeEvent::RemoteRing { device, on } => Event::RemoteRing { id: device.to_string(), on },
             NodeEvent::Discovered(device) => Event::Discovered { device: device.into() },
             NodeEvent::DiscoveryExpired(id) => Event::DiscoveryExpired { id: id.to_string() },
             NodeEvent::Pairing(PairingEvent::SasCode { peer, code }) => {
@@ -3279,6 +3305,67 @@ pub struct NodeOptions {
     pub usb_port: Option<u16>,
 }
 
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayRegion {
+    NorthAmericaEast,
+    NorthAmericaWest,
+    Europe,
+    AsiaPacific,
+    Custom,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayServer {
+    pub url: String,
+    pub provider: String,
+    pub region: RelayRegion,
+    pub enabled: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct HomeRelay {
+    pub url: String,
+    pub connected: bool,
+    pub failed: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayRoute {
+    pub device: String,
+    pub url: String,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelaySnapshot {
+    pub servers: Vec<RelayServer>,
+    pub home: Vec<HomeRelay>,
+    pub routes: Vec<RelayRoute>,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct RelayProbe {
+    pub url: String,
+    pub rtt_ms: Option<u32>,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayEdit {
+    Add,
+    Enable,
+    Disable,
+    Remove,
+}
+
+#[derive(Debug, uniffi::Enum)]
+pub enum RelayEditResult {
+    Saved,
+    InvalidAddress,
+    Duplicate,
+    Limit,
+    Failed,
+}
+
 /// The NectarLink engine. One per app process.
 #[derive(uniffi::Object)]
 pub struct NectarlinkNode {
@@ -3477,6 +3564,15 @@ impl NectarlinkNode {
         self.run(async move { Ok(node.ring(id, on).await?) }).await
     }
 
+    pub async fn stop_ringing(&self) -> Result<()> {
+        let node = self.node.clone();
+        self.run(async move {
+            node.stop_ringing().await;
+            Ok(())
+        })
+        .await
+    }
+
     /// Dismisses a paired phone's or tablet's notification there, after it
     /// was dismissed here (`notify.dismiss`).
     pub async fn dismiss_peer_notification(&self, id: String, key: String) -> Result<()> {
@@ -3514,8 +3610,8 @@ impl NectarlinkNode {
     /// Sends files to a paired PC; returns the transfer's ID. Progress
     /// arrives as `Event::Transfer`.
     pub async fn send_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
+        let files = files_to_send(files)?;
         let id = parse_id(&id)?;
-        let files = files.into_iter().map(file_to_send).collect::<Result<Vec<_>>>()?;
         let node = self.node.clone();
         self.run(async move { Ok(node.send_files(id, files).await?) }).await
     }
@@ -3523,8 +3619,8 @@ impl NectarlinkNode {
     /// Hands off a document to a paired PC and asks the PC to open it with the
     /// default application once it arrives (`docs/protocol/files.md`).
     pub async fn send_handoff_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
+        let files = files_to_send(files)?;
         let id = parse_id(&id)?;
-        let files = files.into_iter().map(file_to_send).collect::<Result<Vec<_>>>()?;
         let node = self.node.clone();
         self.run(async move { Ok(node.send_handoff_files(id, files).await?) }).await
     }
@@ -3537,8 +3633,8 @@ impl NectarlinkNode {
         file: FileToSend,
         markers: Vec<RecordingMarker>,
     ) -> Result<String> {
-        let id = parse_id(&id)?;
         let file = file_to_send(file)?;
+        let id = parse_id(&id)?;
         let markers = markers.into_iter().map(Into::into).collect();
         let node = self.node.clone();
         self.run(async move { Ok(node.send_recording(id, file, markers).await?) }).await
@@ -3925,6 +4021,68 @@ impl NectarlinkNode {
     /// Enables or disables connecting over mobile data / non-LAN paths at runtime.
     pub fn set_away_mode(&self, enabled: bool) {
         self.node.set_away_mode(enabled);
+    }
+
+    pub fn relay_snapshot(&self) -> RelaySnapshot {
+        use core::relays::RelayRegion as Region;
+        let snapshot = self.node.relay_snapshot();
+        RelaySnapshot {
+            servers: snapshot
+                .servers
+                .into_iter()
+                .map(|server| RelayServer {
+                    url: server.url,
+                    provider: server.provider,
+                    region: match server.region {
+                        Region::NorthAmericaEast => RelayRegion::NorthAmericaEast,
+                        Region::NorthAmericaWest => RelayRegion::NorthAmericaWest,
+                        Region::Europe => RelayRegion::Europe,
+                        Region::AsiaPacific => RelayRegion::AsiaPacific,
+                        Region::Custom => RelayRegion::Custom,
+                    },
+                    enabled: server.enabled,
+                })
+                .collect(),
+            home: snapshot
+                .home
+                .into_iter()
+                .map(|relay| HomeRelay { url: relay.url, connected: relay.connected, failed: relay.failed })
+                .collect(),
+            routes: snapshot
+                .routes
+                .into_iter()
+                .map(|route| RelayRoute { device: route.device, url: route.url })
+                .collect(),
+        }
+    }
+
+    pub fn edit_relay(&self, url: String, action: RelayEdit) -> RelayEditResult {
+        use core::relays::{RelayEdit as Edit, RelayEditError};
+        let action = match action {
+            RelayEdit::Add => Edit::Add,
+            RelayEdit::Enable => Edit::Enable,
+            RelayEdit::Disable => Edit::Disable,
+            RelayEdit::Remove => Edit::Remove,
+        };
+        match self.node.edit_relay(&url, action) {
+            Ok(()) => RelayEditResult::Saved,
+            Err(RelayEditError::InvalidAddress) => RelayEditResult::InvalidAddress,
+            Err(RelayEditError::Duplicate) => RelayEditResult::Duplicate,
+            Err(RelayEditError::Limit) => RelayEditResult::Limit,
+            Err(err) => {
+                tracing::warn!(%err, "can't save relay settings");
+                RelayEditResult::Failed
+            }
+        }
+    }
+
+    pub async fn check_relays(&self) -> Vec<RelayProbe> {
+        let node = self.node.clone();
+        self.run(async move { node.check_relays().await })
+            .await
+            .into_iter()
+            .map(|probe| RelayProbe { url: probe.url, rtt_ms: probe.rtt_ms, timed_out: probe.timed_out })
+            .collect()
     }
 
     /// Locks a paired PC (`sleep`: puts it to sleep instead).

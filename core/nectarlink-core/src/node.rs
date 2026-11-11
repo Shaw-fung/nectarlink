@@ -10,7 +10,7 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, EndpointAddr, RelayMode,
+    Endpoint, EndpointAddr, RelayMap, RelayMode, Watcher,
     address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher, PkarrResolver},
     endpoint::{Connection, PortmapperConfig, QuicTransportConfig, VarInt, presets},
     endpoint_info::{EndpointInfo, UserData},
@@ -35,6 +35,9 @@ use crate::{
     identity,
     notifications::{self, Feed},
     pairing::{self, PairingState},
+    relays::{
+        self, HomeRelay, RelayEdit, RelayEditError, RelayProbe, RelayRoute, RelaySettings, RelaySnapshot,
+    },
     session::{self, CLOSE_DUPLICATE, CLOSE_NORMAL, REQUEST_TIMEOUT, Session},
     store::Store,
     transfer,
@@ -145,6 +148,7 @@ const NOTIFICATION_HISTORY_MAX: usize = 1000;
 
 pub(crate) struct Shared {
     pub id: DeviceId,
+    secret: iroh::SecretKey,
     pub endpoint: Endpoint,
     pub store: Store,
     pub platform: Arc<dyn Platform>,
@@ -176,6 +180,10 @@ pub(crate) struct Shared {
     /// The last capability matrix emitted per device, to emit only changes.
     matrices: Mutex<HashMap<DeviceId, CapabilityMatrix>>,
     pub(crate) away_mode: std::sync::atomic::AtomicBool,
+    relay_settings: Mutex<RelaySettings>,
+    relay_map: RelayMap,
+    #[cfg(target_os = "linux")]
+    relay_connector: Option<crate::direct_network::RelayConnector>,
     memory: MemoryLookup,
     /// This device's notifications, when it mirrors them (phones).
     pub notifications: Feed,
@@ -183,6 +191,7 @@ pub(crate) struct Shared {
     pub(crate) notification_history: Mutex<Vec<Notification>>,
     /// This device's media players (docs/protocol/media.md).
     pub players: crate::media::Players,
+    pub(crate) rings: crate::ring::Rings,
     /// This phone's call in progress (docs/protocol/calls.md).
     pub(crate) calls: crate::calls::Current,
     /// This phone's quick settings state (docs/protocol/toggles.md).
@@ -195,6 +204,8 @@ pub(crate) struct Shared {
     pub(crate) deck: crate::deck::Current,
     /// Stop signals for phone screens shown here, by phone.
     pub(crate) mirror_stops: Mutex<HashMap<MirrorStop, Arc<tokio::sync::Notify>>>,
+    /// Active outgoing mirror session IDs requested by peers (`(peer, session)`).
+    pub(crate) outgoing_mirror_sessions: Mutex<std::collections::HashSet<(DeviceId, u32)>>,
     /// Peers granted one-time reverse-mirror consent for the current session.
     pub(crate) pc_mirror_sessions: Mutex<std::collections::HashSet<DeviceId>>,
     /// Play on phone offers this PC made, by phone: the player and when.
@@ -216,12 +227,14 @@ pub(crate) struct Shared {
     pub(crate) localsend: crate::localsend::LocalSendState,
     /// Bound loopback TCP port for the phone-side USB tunnel listener (0 if disabled).
     pub(crate) usb_listener_port: std::sync::atomic::AtomicU16,
-    /// Active loopback UDP bridge ports carrying USB-tunneled QUIC traffic.
-    pub(crate) usb_bridge_ports: Arc<Mutex<std::collections::HashSet<u16>>>,
+    /// Active loopback UDP bridge ports mapped to the `DeviceId` their `UsbHello` claimed.
+    pub(crate) usb_bridge_ports: Arc<Mutex<HashMap<u16, DeviceId>>>,
+    /// USB tunnels whose plaintext `UsbHello` arrived but whose QUIC identity is not yet verified.
+    pub(crate) usb_pending: Mutex<HashMap<u16, PendingUsbTunnel>>,
     /// Active USB tunnel peers mapped to their local UDP bridge address and cancellation token.
     pub(crate) usb_peers: Arc<Mutex<HashMap<DeviceId, (SocketAddr, CancellationToken)>>>,
-    /// The adb serial (and adb server) each USB-tunnelled phone is on.
-    pub(crate) usb_serials: Mutex<HashMap<DeviceId, (String, SocketAddr)>>,
+    /// The adb serial, adb server, and local UDP bridge port each USB-tunnelled phone is on.
+    pub(crate) usb_serials: Mutex<HashMap<DeviceId, (String, SocketAddr, u16)>>,
     /// Elevated helpers started over USB, by phone: they run until dropped.
     pub(crate) usb_helpers: Mutex<HashMap<DeviceId, tokio::task::JoinHandle<()>>>,
     /// Peers whose USB tunnel this device accepted (a phone plugged into that PC).
@@ -262,6 +275,17 @@ pub(crate) struct TransferControl {
     /// know it was paused yet: the resume travels on the control stream and
     /// can overtake the paused transfer stream's reset.
     pub early_resume: Option<std::time::Instant>,
+}
+
+pub(crate) struct PendingUsbTunnel {
+    pub peer: DeviceId,
+    pub name: String,
+    pub bridge_addr: SocketAddr,
+    pub cancel: CancellationToken,
+    pub inbound: bool,
+    pub auto_pair: bool,
+    pub serial: Option<(String, SocketAddr)>,
+    pub on_verified: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -712,7 +736,11 @@ impl Shared {
             !p.is_relay()
                 && match p.remote_addr() {
                     iroh::TransportAddr::Ip(addr) => {
-                        self.is_usb_addr(addr) || self.is_allowed_peer_ip(&peer, addr.ip())
+                        if self.is_usb_addr(addr) {
+                            self.is_usb_addr_for(&peer, addr)
+                        } else {
+                            self.is_allowed_peer_ip(&peer, addr.ip())
+                        }
                     }
                     _ => false,
                 }
@@ -752,36 +780,55 @@ impl Shared {
                     return addrs;
                 }
                 return self
-                    .endpoint
-                    .bound_sockets()
-                    .into_iter()
-                    .find(|a| a.is_ipv4() && a.port() != 0)
-                    .map(|a| vec![SocketAddr::from(([127, 0, 0, 1], a.port()))])
+                    .bound_v4_port()
+                    .map(|port| vec![SocketAddr::from(([127, 0, 0, 1], port))])
                     .unwrap_or_default();
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
-    /// Returns the local IPv4 UDP port the QUIC endpoint is bound to.
+    /// Returns the wildcard IPv4 UDP port used by the USB bridge.
     pub(crate) fn bound_v4_port(&self) -> Option<u16> {
-        self.endpoint.bound_sockets().into_iter().find(|a| a.is_ipv4() && a.port() != 0).map(|a| a.port())
+        self.endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4() && addr.ip().is_unspecified() && addr.port() != 0)
+            .map(|addr| addr.port())
     }
 
-    pub(crate) fn register_usb_bridge_port(&self, port: u16) {
-        lock(&self.usb_bridge_ports).insert(port);
+    pub(crate) fn register_usb_bridge_port(&self, port: u16, peer: DeviceId) {
+        lock(&self.usb_bridge_ports).insert(port, peer);
     }
 
     pub(crate) fn unregister_usb_bridge_port(&self, port: u16) {
         lock(&self.usb_bridge_ports).remove(&port);
+        lock(&self.usb_pending).remove(&port);
+    }
+
+    pub(crate) fn cancel_pending_usb_port(&self, port: u16) {
+        if let Some(pending) = lock(&self.usb_pending).remove(&port) {
+            pending.cancel.cancel();
+        }
     }
 
     pub(crate) fn is_usb_addr(&self, addr: &SocketAddr) -> bool {
-        addr.ip().to_canonical().is_loopback() && lock(&self.usb_bridge_ports).contains(&addr.port())
+        addr.ip().to_canonical().is_loopback() && lock(&self.usb_bridge_ports).contains_key(&addr.port())
+    }
+
+    pub(crate) fn is_usb_addr_for(&self, peer: &DeviceId, addr: &SocketAddr) -> bool {
+        addr.ip().to_canonical().is_loopback() && lock(&self.usb_bridge_ports).get(&addr.port()) == Some(peer)
     }
 
     pub(crate) fn usb_peer_addr(&self, peer: &DeviceId) -> Option<SocketAddr> {
         lock(&self.usb_peers).get(peer).map(|(addr, _)| *addr)
+    }
+
+    pub(crate) fn usb_peer_or_pending_addr(&self, peer: &DeviceId) -> Option<(SocketAddr, bool)> {
+        if let Some(addr) = self.usb_peer_addr(peer) {
+            return Some((addr, false));
+        }
+        lock(&self.usb_pending).values().find(|p| &p.peer == peer).map(|p| (p.bridge_addr, true))
     }
 
     /// Whether `peer` is a PC this phone is plugged into: the PC dials through the cable.
@@ -797,9 +844,96 @@ impl Shared {
             return true;
         }
         conn.paths().iter().any(|p| match p.remote_addr() {
-            iroh::TransportAddr::Ip(addr) => self.is_usb_addr(addr),
+            iroh::TransportAddr::Ip(addr) => self.is_usb_addr_for(&peer, addr),
             _ => false,
         })
+    }
+
+    /// Verifies that if `conn` uses a local USB bridge port, its QUIC TLS `DeviceId`
+    /// matches the `UsbHello` recorded for that bridge port, promoting the pending
+    /// USB tunnel only once authenticated.
+    pub(crate) async fn verify_usb_connection(self: &Arc<Self>, conn: &Connection) -> bool {
+        let peer = crate::device_id(&conn.remote_id());
+        let has_pending_for_peer = || lock(&self.usb_pending).values().any(|p| p.peer == peer);
+        let max_iters = if has_pending_for_peer() { 25 } else { 1 };
+        for i in 0..max_iters {
+            let mut matched_ports = Vec::new();
+            for p in conn.paths().iter() {
+                let iroh::TransportAddr::Ip(addr) = p.remote_addr() else { continue };
+                if !addr.ip().to_canonical().is_loopback() {
+                    continue;
+                }
+                let Some(expected) = lock(&self.usb_bridge_ports).get(&addr.port()).copied() else {
+                    continue;
+                };
+                if expected != peer {
+                    self.cancel_pending_usb_port(addr.port());
+                    return false;
+                }
+                matched_ports.push(addr.port());
+            }
+            if !matched_ports.is_empty() {
+                for port in matched_ports {
+                    let pending = lock(&self.usb_pending).remove(&port);
+                    if let Some(pending) = pending {
+                        self.activate_usb_tunnel(pending);
+                    }
+                }
+                return true;
+            }
+            if i + 1 < max_iters && has_pending_for_peer() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
+    fn activate_usb_tunnel(self: &Arc<Self>, mut pending: PendingUsbTunnel) {
+        let peer = pending.peer;
+        let bridge_addr = pending.bridge_addr;
+        let bridge_port = bridge_addr.port();
+        if let Some(cb) = pending.on_verified.take() {
+            cb();
+        }
+        if let Some((old_addr, old_cancel)) =
+            lock(&self.usb_peers).insert(peer, (bridge_addr, pending.cancel))
+            && old_addr != bridge_addr
+        {
+            old_cancel.cancel();
+        }
+        if pending.inbound {
+            lock(&self.usb_inbound).insert(peer);
+        } else {
+            lock(&self.usb_inbound).remove(&peer);
+            if pending.auto_pair {
+                lock(&self.usb_manual_pair).remove(&peer);
+            } else {
+                lock(&self.usb_manual_pair).insert(peer);
+            }
+            if let Some((serial, adb_addr)) = pending.serial {
+                lock(&self.usb_serials).insert(peer, (serial, adb_addr, bridge_port));
+            }
+        }
+        self.note_discovered(peer, (!pending.name.is_empty()).then_some(pending.name));
+        self.remember_addrs(&peer, &[bridge_addr]);
+        if self.store.is_paired(&peer).unwrap_or(false) {
+            self.start_supervisor(peer);
+            self.wake_supervisor(&peer);
+            if let Some(session) = self.session(&peer) {
+                self.publish_online(&session);
+            }
+            self.refresh_capabilities(&peer);
+        } else if !pending.inbound && pending.auto_pair {
+            let s = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !s.store.is_paired(&peer).unwrap_or(false) {
+                    let _ = pairing::start_nearby(&s, peer).await;
+                }
+            });
+        }
     }
 
     pub(crate) fn note_discovered(&self, peer: DeviceId, name: Option<String>) {
@@ -820,24 +954,34 @@ impl Shared {
         bridge_addr: SocketAddr,
         cancel: CancellationToken,
     ) {
-        if let Some((old_addr, old_cancel)) = lock(&self.usb_peers).insert(peer, (bridge_addr, cancel))
-            && old_addr != bridge_addr
-        {
-            old_cancel.cancel();
+        let port = bridge_addr.port();
+        if let Some(old) = lock(&self.usb_pending).insert(
+            port,
+            PendingUsbTunnel {
+                peer,
+                name,
+                bridge_addr,
+                cancel: cancel.clone(),
+                inbound: true,
+                auto_pair: false,
+                serial: None,
+                on_verified: None,
+            },
+        ) {
+            old.cancel.cancel();
         }
-        lock(&self.usb_inbound).insert(peer);
-        self.note_discovered(peer, (!name.is_empty()).then_some(name));
-        self.remember_addrs(&peer, &[bridge_addr]);
-        if self.store.is_paired(&peer).unwrap_or(false) {
-            self.start_supervisor(peer);
-            self.wake_supervisor(&peer);
-            if let Some(session) = self.session(&peer) {
-                self.publish_online(&session);
+        let s = self.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = tokio::time::sleep(DIAL_TIMEOUT + Duration::from_secs(5)) => {
+                    s.cancel_pending_usb_port(port);
+                }
             }
-            self.refresh_capabilities(&peer);
-        }
+        });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_usb_tunnel_connected(
         self: &Arc<Self>,
         peer: DeviceId,
@@ -845,51 +989,48 @@ impl Shared {
         bridge_addr: SocketAddr,
         cancel: CancellationToken,
         auto_pair: bool,
+        serial: Option<(String, SocketAddr)>,
+        on_verified: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        if let Some((old_addr, old_cancel)) = lock(&self.usb_peers).insert(peer, (bridge_addr, cancel))
-            && old_addr != bridge_addr
-        {
-            old_cancel.cancel();
+        let port = bridge_addr.port();
+        if let Some(old) = lock(&self.usb_pending).insert(
+            port,
+            PendingUsbTunnel {
+                peer,
+                name,
+                bridge_addr,
+                cancel,
+                inbound: false,
+                auto_pair,
+                serial,
+                on_verified,
+            },
+        ) {
+            old.cancel.cancel();
         }
-        if auto_pair {
-            lock(&self.usb_manual_pair).remove(&peer);
-        } else {
-            lock(&self.usb_manual_pair).insert(peer);
-        }
-        self.note_discovered(peer, (!name.is_empty()).then_some(name));
-        self.remember_addrs(&peer, &[bridge_addr]);
-        if self.store.is_paired(&peer).unwrap_or(false) {
-            self.start_supervisor(peer);
-            self.wake_supervisor(&peer);
-            self.refresh_capabilities(&peer);
-            let s = self.clone();
-            tokio::spawn(async move {
-                s.endpoint.network_change().await;
-                if let Some(session) = s.session(&peer) {
-                    s.publish_online(&session);
-                    s.refresh_capabilities(&peer);
-                } else {
-                    s.wake_supervisor(&peer);
-                }
-            });
-        } else if auto_pair {
-            let s = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                if !s.store.is_paired(&peer).unwrap_or(false) {
-                    let _ = pairing::start_nearby(&s, peer).await;
-                }
-            });
-        }
+        let s = self.clone();
+        tokio::spawn(async move {
+            s.probe_usb_tunnel(peer, bridge_addr).await;
+        });
     }
 
     pub(crate) async fn on_usb_tunnel_disconnected(&self, peer: DeviceId, bridge_addr: SocketAddr) {
+        let bridge_port = bridge_addr.port();
+        lock(&self.usb_pending).remove(&bridge_port);
         let removed = {
             let mut peers = lock(&self.usb_peers);
             if peers.get(&peer).is_some_and(|(addr, _)| *addr == bridge_addr) {
                 peers.remove(&peer);
                 lock(&self.usb_inbound).remove(&peer);
                 lock(&self.usb_manual_pair).remove(&peer);
+                let mut serials = lock(&self.usb_serials);
+                if serials.get(&peer).is_some_and(|(_, _, port)| *port == bridge_port) {
+                    serials.remove(&peer);
+                    // The cable is out: a helper started over it has stopped with it.
+                    if let Some(helper) = lock(&self.usb_helpers).remove(&peer) {
+                        helper.abort();
+                    }
+                }
                 true
             } else {
                 false
@@ -908,10 +1049,14 @@ impl Shared {
             self.remember_addrs(&peer, &record.last_addrs);
         }
         self.endpoint.network_change().await;
-        self.wake_supervisor(&peer);
         if let Some(session) = self.session(&peer) {
-            self.publish_online(&session);
+            if session.uses_usb_bridge_port(bridge_port) {
+                session.close(CLOSE_NORMAL, b"usb disconnected");
+            } else {
+                self.publish_online(&session);
+            }
         }
+        self.wake_supervisor(&peer);
         self.refresh_capabilities(&peer);
     }
 
@@ -935,7 +1080,7 @@ impl Shared {
             .iter()
             .copied()
             .filter(|a| {
-                if self.is_usb_addr(a) {
+                if self.is_usb_addr_for(peer, a) {
                     true
                 } else if a.ip().is_loopback() {
                     false
@@ -1033,6 +1178,7 @@ impl Shared {
         // The same physical device paired again (after a reinstall it has a new identity):
         // move its history and queue to the new pairing and forget the old one. Only the
         // install ID decides; same-name devices (two family phones) stay separate.
+        let online_peers: Vec<DeviceId> = self.live_sessions().into_iter().map(|s| s.peer).collect();
         let replaced: Vec<DeviceId> = match info.install_id.as_deref() {
             Some(install_id) => self
                 .store
@@ -1041,7 +1187,7 @@ impl Shared {
                 .into_iter()
                 .filter(|old| {
                     old.id != peer
-                        && self.session(&old.id).is_none()
+                        && !online_peers.contains(&old.id)
                         && old.info.kind == info.kind
                         && old.info.install_id.as_deref() == Some(install_id)
                 })
@@ -1051,7 +1197,7 @@ impl Shared {
         };
         // Store the new pairing first: if that fails, the old one is untouched.
         // Storing it also moves the old entry's history and queue over.
-        self.store.upsert_peer(&peer, &info, paired_at)?;
+        self.store.upsert_peer_skipping(&peer, &info, paired_at, &online_peers)?;
         for old in replaced {
             let _ = self.store.reassign_timeline(&old, &peer);
             let _ = self.store.reassign_send_queue_peer(&old, &peer);
@@ -1081,7 +1227,7 @@ impl Shared {
     }
 
     /// Removes a paired device locally (after we or the peer unpaired).
-    pub async fn forget_peer(&self, peer: &DeviceId) -> Result<()> {
+    pub async fn forget_peer(self: &Arc<Self>, peer: &DeviceId) -> Result<()> {
         let peer_name = self.peer_name(peer);
         let dropped_count = self
             .store
@@ -1128,6 +1274,10 @@ impl Shared {
         lock(&self.storage).remove_peer(peer);
         self.toggles.remove_peer(peer);
         self.deck.remove_peer(peer);
+        self.clear_remote_ring(*peer, None);
+        let peer_id = *peer;
+        self.stop_local_ring_if(move |ring| ring.peer == peer_id).await;
+        self.notifications.clear_peer(peer);
         self.stop_webcam(peer);
         // The session was removed above, so `on_session_end` won't clear these:
         // a one-time "show my screen" must not outlive the pairing.
@@ -1135,6 +1285,7 @@ impl Shared {
         lock(&self.watch_offers).remove(peer);
         self.stop_mic(peer);
         self.stop_showing_all(peer);
+        self.take_outgoing_mirror_sessions(peer);
         // Unpaired, it's a LocalSend device like any other again.
         if lock(&self.paired_localsend).remove(peer).is_some() {
             self.emit(NodeEvent::LocalSendChanged);
@@ -1183,9 +1334,16 @@ impl Shared {
             conn.close(VarInt::from_u32(CLOSE_NORMAL), b"reconnect off");
             return None;
         }
+        let is_usb = self.is_usb_connection(&conn);
         let mut sessions = lock(&self.sessions);
         if let Some(existing) = sessions.get(&peer).filter(|s| s.is_alive()) {
-            let keep_existing = existing.dialer != dialer && existing.dialer < dialer;
+            let keep_existing = if is_usb && existing.path() != ConnectionPath::Usb {
+                false
+            } else if !is_usb && existing.path() == ConnectionPath::Usb {
+                true
+            } else {
+                existing.dialer != dialer && existing.dialer < dialer
+            };
             if keep_existing {
                 drop(sessions);
                 conn.close(VarInt::from_u32(CLOSE_DUPLICATE), b"duplicate");
@@ -1275,9 +1433,9 @@ impl Shared {
             {
                 let _ = s.send(env).await;
             }
+            shared.send_media_state(&s).await;
             shared.send_held_notifications(&s).await;
             shared.send_notification_snapshot(&s).await;
-            shared.send_media_state(&s).await;
             shared.send_call_state(&s).await;
             shared.send_toggles_state(&s).await;
             crate::actions::send_wake_info(&shared, &s).await;
@@ -1294,6 +1452,7 @@ impl Shared {
         let current = sessions.get(&ended.peer).is_some_and(|current| Arc::ptr_eq(current, ended));
         if current {
             sessions.remove(&ended.peer);
+            self.clear_remote_ring(ended.peer, None);
             lock(&self.pc_mirror_sessions).remove(&ended.peer);
             lock(&self.watch_offers).remove(&ended.peer);
             lock(&self.storage).remove_peer(&ended.peer);
@@ -1309,6 +1468,19 @@ impl Shared {
                 self.set_link(ended.peer, LinkState::Offline { last_seen: Some(crate::now_unix()) });
             }
             drop(sessions);
+            self.stop_showing_all(&ended.peer);
+            self.stop_webcam(&ended.peer);
+            self.stop_mic(&ended.peer);
+            let outgoing = self.take_outgoing_mirror_sessions(&ended.peer);
+            if !outgoing.is_empty() {
+                let peer = ended.peer;
+                let platform = self.platform.clone();
+                tokio::task::spawn_blocking(move || {
+                    for session_id in outgoing {
+                        platform.mirror_stop_requested(&peer, session_id);
+                    }
+                });
+            }
             let _ = self.store.clear_send_queue_retry_delays(&ended.peer);
             self.queue_notify.notify_waiters();
         }
@@ -1352,7 +1524,7 @@ impl Shared {
             .map_err(crate::error::net)?;
         let mut guard = CloseOnDrop(Some(conn));
         let conn_ref = guard.0.as_ref().expect("connection present");
-        if !self.wait_connection_allowed(conn_ref).await {
+        if !self.verify_usb_connection(conn_ref).await || !self.wait_connection_allowed(conn_ref).await {
             tracing::debug!(peer = %peer.short(), "refusing outgoing session on non-LAN path while away_mode is off");
             if let Some(c) = guard.0.take() {
                 c.close(VarInt::from_u32(CLOSE_NORMAL), b"away mode disabled");
@@ -1365,6 +1537,41 @@ impl Shared {
         self.register_session(conn, self.id, (send, recv), remote)
             .or_else(|| self.session(&peer))
             .ok_or(Error::Offline)
+    }
+
+    /// Verifies a newly connected USB tunnel by completing a QUIC TLS 1.3 handshake
+    /// exclusively over `bridge_addr` before trusting `UsbHello`.
+    pub(crate) async fn probe_usb_tunnel(self: &Arc<Self>, peer: DeviceId, bridge_addr: SocketAddr) {
+        let Ok(key) = crate::public_key(&peer) else {
+            self.cancel_pending_usb_port(bridge_addr.port());
+            return;
+        };
+        let Ok(builder) = Endpoint::builder(presets::Minimal)
+            .secret_key(self.secret.clone())
+            .relay_mode(RelayMode::Disabled)
+            .portmapper_config(PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+        else {
+            self.cancel_pending_usb_port(bridge_addr.port());
+            return;
+        };
+        let Ok(probe_ep) = builder.bind().await else {
+            self.cancel_pending_usb_port(bridge_addr.port());
+            return;
+        };
+        let addr = EndpointAddr::new(key).with_ip_addr(bridge_addr);
+        let Ok(Ok(conn)) = tokio::time::timeout(DIAL_TIMEOUT, probe_ep.connect(addr, ALPN_SESSION)).await
+        else {
+            self.cancel_pending_usb_port(bridge_addr.port());
+            probe_ep.close().await;
+            return;
+        };
+        if !self.verify_usb_connection(&conn).await || self.usb_peer_addr(&peer) != Some(bridge_addr) {
+            self.cancel_pending_usb_port(bridge_addr.port());
+        }
+        conn.close(VarInt::from_u32(CLOSE_NORMAL), b"usb probe");
+        probe_ep.close().await;
     }
 
     /// Sends a message to every connected device.
@@ -1466,7 +1673,9 @@ async fn maintain(shared: Weak<Shared>, peer: DeviceId, wake: Arc<Notify>, cance
                 _ = session.cancel.cancelled() => {}
                 _ = cancel.cancelled() => return,
             }
-            if session.started.elapsed() >= Duration::from_secs(15) {
+            if session.started.elapsed() >= Duration::from_secs(15)
+                || shared.upgrade().is_some_and(|n| n.session(&peer).is_some())
+            {
                 backoff = BACKOFF_MIN;
                 continue;
             }
@@ -1553,6 +1762,11 @@ impl ProtocolHandler for SessionProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let Some(shared) = self.0.upgrade() else { return Err(AcceptError::from_err(Error::Offline)) };
         let peer = crate::device_id(&conn.remote_id());
+        if !shared.verify_usb_connection(&conn).await {
+            tracing::debug!(peer = %peer.short(), "refusing session: USB hello identity mismatch");
+            conn.close(VarInt::from_u32(ErrorCode::Denied.close_code()), b"usb identity mismatch");
+            return Err(AcceptError::from_err(Error::Denied));
+        }
         if !shared.store.is_paired(&peer).unwrap_or(false) {
             tracing::debug!(peer = %peer.short(), "refusing session from unpaired device");
             conn.close(VarInt::from_u32(ErrorCode::Unpaired.close_code()), b"unpaired");
@@ -1584,6 +1798,15 @@ struct PairProtocol(Weak<Shared>);
 impl ProtocolHandler for PairProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let Some(shared) = self.0.upgrade() else { return Err(AcceptError::from_err(Error::Offline)) };
+        if !shared.verify_usb_connection(&conn).await {
+            conn.close(VarInt::from_u32(ErrorCode::Denied.close_code()), b"usb identity mismatch");
+            return Err(AcceptError::from_err(Error::Denied));
+        }
+        if !shared.wait_connection_allowed(&conn).await {
+            tracing::debug!("refusing incoming pairing on non-LAN path while away_mode is off");
+            conn.close(VarInt::from_u32(CLOSE_NORMAL), b"away mode disabled");
+            return Err(AcceptError::from_err(Error::Offline));
+        }
         pairing::accept(shared, conn).await;
         Ok(())
     }
@@ -1613,6 +1836,20 @@ impl Node {
         let protector = config.key_protector.clone().unwrap_or_else(identity::default_protector);
         let secret = identity::load_or_create(&config.data_dir, protector.as_ref())?;
         let store = Store::open(&config.data_dir)?;
+        let relay_settings = store.relay_settings().unwrap_or_else(|err| {
+            tracing::warn!(%err, "can't load relay settings; using defaults");
+            RelaySettings::default()
+        });
+        let relay_map = relay_settings.enabled_map(config.away_mode);
+        #[cfg(not(target_os = "linux"))]
+        let proxy = None;
+        #[cfg(target_os = "linux")]
+        let relay_connector = match config.network_interface.as_ref().filter(|name| !name.is_empty()) {
+            Some(name) => Some(crate::direct_network::RelayConnector::start(name.clone()).await?),
+            None => None,
+        };
+        #[cfg(target_os = "linux")]
+        let proxy = relay_connector.as_ref().map(|route| route.url());
         if let Err(e) = store.seal_queue_with(protector.clone()) {
             tracing::warn!(error = %e, "can't seal the send queue");
         }
@@ -1632,19 +1869,19 @@ impl Node {
             if config.port != 0 { Some(Ports { v4: config.port, v6: Some(config.port) }) } else { saved };
         // Right after a restart the previous process may still be letting go
         // of the ports, so try them for a moment before taking others.
-        let mut bound = bind_endpoint(&config, secret.clone(), wanted).await;
+        let mut bound = bind_endpoint(&config, secret.clone(), wanted, relay_map.clone(), proxy).await;
         for _ in 0..PORT_RETRIES {
             if bound.is_ok() || wanted.is_none() {
                 break;
             }
             tokio::time::sleep(PORT_RETRY_DELAY).await;
-            bound = bind_endpoint(&config, secret.clone(), wanted).await;
+            bound = bind_endpoint(&config, secret.clone(), wanted, relay_map.clone(), proxy).await;
         }
         let endpoint = match bound {
             Ok(endpoint) => endpoint,
             Err(e) if config.port == 0 && wanted.is_some() => {
                 tracing::info!(error = %e, "saved ports unavailable; using others");
-                bind_endpoint(&config, secret, None).await?
+                bind_endpoint(&config, secret.clone(), None, relay_map.clone(), proxy).await?
             }
             Err(e) => return Err(e),
         };
@@ -1663,6 +1900,7 @@ impl Node {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let shared = Arc::new(Shared {
             id,
+            secret,
             endpoint: endpoint.clone(),
             store,
             platform,
@@ -1689,16 +1927,22 @@ impl Node {
             dial_failures: Mutex::new(HashMap::new()),
             matrices: Mutex::new(HashMap::new()),
             away_mode: std::sync::atomic::AtomicBool::new(config.away_mode),
+            relay_settings: Mutex::new(relay_settings),
+            relay_map,
+            #[cfg(target_os = "linux")]
+            relay_connector,
             memory,
             notifications: Feed::default(),
             notification_history: Mutex::new(Vec::new()),
             players: Default::default(),
+            rings: Default::default(),
             calls: Default::default(),
             toggles: Default::default(),
             wake_info: Default::default(),
             tasks: Default::default(),
             deck: Default::default(),
             mirror_stops: Mutex::new(HashMap::new()),
+            outgoing_mirror_sessions: Mutex::new(std::collections::HashSet::new()),
             pc_mirror_sessions: Mutex::new(std::collections::HashSet::new()),
             watch_offers: Mutex::new(HashMap::new()),
             webcam_stops: Mutex::new(HashMap::new()),
@@ -1710,7 +1954,8 @@ impl Node {
             private_clip_lifetime: config.private_clip_lifetime,
             localsend,
             usb_listener_port: std::sync::atomic::AtomicU16::new(0),
-            usb_bridge_ports: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            usb_bridge_ports: Arc::new(Mutex::new(HashMap::new())),
+            usb_pending: Mutex::new(HashMap::new()),
             usb_peers: Arc::new(Mutex::new(HashMap::new())),
             usb_serials: Mutex::new(HashMap::new()),
             usb_helpers: Mutex::new(HashMap::new()),
@@ -1765,6 +2010,83 @@ impl Node {
         self.shared.away_mode()
     }
 
+    /// Configured relays, the endpoint's home relays and routes in use by paired devices.
+    pub fn relay_snapshot(&self) -> RelaySnapshot {
+        let servers = lock(&self.shared.relay_settings).servers();
+        let home = self
+            .shared
+            .endpoint
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .map(|relay| HomeRelay {
+                url: relay.url().to_string(),
+                connected: relay.is_connected(),
+                failed: relay.last_error().is_some(),
+            })
+            .collect();
+        let mut routes: Vec<_> = self
+            .shared
+            .live_sessions()
+            .into_iter()
+            .filter_map(|session| {
+                let url = session.relay_url()?.to_string();
+                let device = self
+                    .shared
+                    .store
+                    .get_peer(&session.peer)
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| session.peer.short(), |peer| peer.info.name);
+                Some(RelayRoute { device, url })
+            })
+            .collect();
+        routes.sort_by(|a, b| a.device.cmp(&b.device).then_with(|| a.url.cmp(&b.url)));
+        RelaySnapshot { servers, home, routes }
+    }
+
+    /// Saves a relay change and updates the running endpoint without restarting the node.
+    pub fn edit_relay(&self, url: &str, action: RelayEdit) -> std::result::Result<(), RelayEditError> {
+        let mut settings = lock(&self.shared.relay_settings);
+        let mut next = settings.clone();
+        next.edit(url, action)?;
+        self.shared.store.save_relay_settings(&next)?;
+        *settings = next;
+        drop(settings);
+
+        let shared = self.shared.clone();
+        self.shared.runtime.spawn(async move {
+            let _one_at_a_time = shared.away_switch.lock().await;
+            if apply_relays(&shared, shared.away_mode()).await {
+                shared.endpoint.network_change().await;
+                shared.nudge_reconnect();
+            }
+        });
+        Ok(())
+    }
+
+    /// Checks all listed relays on demand, even while Away mode is off.
+    pub async fn check_relays(&self) -> Vec<RelayProbe> {
+        let servers = lock(&self.shared.relay_settings).servers();
+        #[cfg(not(target_os = "linux"))]
+        let proxy = None;
+        #[cfg(target_os = "linux")]
+        let proxy = self.shared.relay_connector.as_ref().map(|route| route.url());
+        relays::probe_servers(&self.shared.endpoint, servers, proxy).await
+    }
+
+    /// Changes the relay route and retires TCP connections on the old route.
+    /// Returns false if the relay connector needs to be enabled on restart.
+    #[cfg(target_os = "linux")]
+    pub fn set_relay_interface(&self, name: &str) -> Result<bool> {
+        crate::direct_network::validate_interface(name)?;
+        let Some(connector) = &self.shared.relay_connector else { return Ok(false) };
+        connector.select(name);
+        let shared = self.shared.clone();
+        self.shared.runtime.spawn(async move { shared.endpoint.network_change().await });
+        Ok(true)
+    }
+
     /// Enables or disables connecting over mobile data / non-LAN paths at runtime.
     pub fn set_away_mode(&self, enabled: bool) {
         let was = self.shared.away_mode.swap(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -1800,6 +2122,7 @@ impl Node {
     /// Stops all sessions and networking.
     pub async fn shutdown(&self) {
         self.shared.cancel.cancel();
+        self.stop_ringing().await;
         crate::elevated_usb::stop_all(&self.shared);
         self.shared.localsend.stop(&self.shared);
         let sessions: Vec<_> = lock(&self.shared.sessions).drain().map(|(_, s)| s).collect();
@@ -1810,6 +2133,10 @@ impl Node {
             tracing::warn!(error = %e, "router shutdown failed");
         }
         self.shared.endpoint.close().await;
+        #[cfg(target_os = "linux")]
+        if let Some(connector) = &self.shared.relay_connector {
+            connector.close();
+        }
     }
 
     pub fn device_id(&self) -> DeviceId {
@@ -1982,9 +2309,21 @@ impl Node {
 
     /// Asks a device to start or stop ringing.
     pub async fn ring(&self, peer: DeviceId, on: bool) -> Result<()> {
-        let reply = self.request(peer, Envelope::new(types::DEVICE_RING, &Ring { on })?).await?;
-        reply.expect(types::OK)?;
-        Ok(())
+        let session = self.connected(&peer)?;
+        let _command = session.ring_command.lock().await;
+        let token =
+            if on { Some(self.shared.start_remote_ring(peer)) } else { self.shared.remote_ring_token(peer) };
+        let reply = self.request(peer, Envelope::new(types::DEVICE_RING, &Ring { on, token })?).await;
+        let result = reply.and_then(|reply| Ok(reply.expect(types::OK)?));
+        if !on || result.is_err() {
+            self.shared.clear_remote_ring(peer, token);
+        }
+        result
+    }
+
+    /// Stops the local alarm and informs the device that started it.
+    pub async fn stop_ringing(&self) {
+        self.shared.stop_local_ring_if(|_| true).await;
     }
 
     /// Sends a request to a connected device. If the connection is replaced
@@ -2092,12 +2431,16 @@ impl Node {
         if toggle == crate::toggles::TOGGLE {
             self.shared.toggles_toggled(peer, enabled);
         }
-        if toggle == crate::actions::POWER_TOGGLE
+        if (toggle == crate::actions::POWER_TOGGLE || toggle == crate::deck::INPUT_TOGGLE)
             && let Some(session) = self.shared.session(&peer)
         {
             let shared = self.shared.clone();
+            let is_power = toggle == crate::actions::POWER_TOGGLE;
             self.shared.runtime.spawn(async move {
-                crate::actions::send_wake_info(&shared, &session).await;
+                if is_power {
+                    crate::actions::send_wake_info(&shared, &session).await;
+                }
+                shared.send_deck(&session).await;
             });
         }
         if toggle == crate::storage::TOGGLE {
@@ -2112,16 +2455,27 @@ impl Node {
             if toggle == crate::mirror::PC_MIRROR_TOGGLE {
                 lock(&self.shared.pc_mirror_sessions).remove(&peer);
             }
-            self.shared.stop_showing_all(&peer);
+            let mut sessions_to_stop = self.shared.stop_showing_all(&peer);
+            for s in self.shared.take_outgoing_mirror_sessions(&peer) {
+                if !sessions_to_stop.contains(&s) {
+                    sessions_to_stop.push(s);
+                }
+            }
+            if !sessions_to_stop.contains(&crate::MIRROR_SCREEN) {
+                sessions_to_stop.push(crate::MIRROR_SCREEN);
+            }
             let platform = self.shared.platform.clone();
-            drop(
-                self.shared
-                    .runtime
-                    .spawn_blocking(move || platform.mirror_stop_requested(&peer, crate::MIRROR_SCREEN)),
-            );
+            let local_sessions = sessions_to_stop.clone();
+            drop(self.shared.runtime.spawn_blocking(move || {
+                for s in local_sessions {
+                    platform.mirror_stop_requested(&peer, s);
+                }
+            }));
             if let Some(session) = self.shared.session(&peer) {
                 self.shared.runtime.spawn(async move {
-                    let _ = crate::mirror::stop(&session, crate::MIRROR_SCREEN).await;
+                    for s in sessions_to_stop {
+                        let _ = crate::mirror::stop(&session, s).await;
+                    }
                 });
             }
         }
@@ -3387,12 +3741,9 @@ impl Node {
             let mut hist = lock(&self.shared.notification_history);
             hist.retain(|n| n.key != clean.key);
             hist.push(clean);
+            hist.sort_by(|a, b| b.when.cmp(&a.when).then_with(|| a.key.cmp(&b.key)));
             // Kept in memory with icons and pictures: drop the oldest past the cap.
-            if hist.len() > NOTIFICATION_HISTORY_MAX
-                && let Some(oldest) = hist.iter().enumerate().min_by_key(|(_, n)| n.when).map(|(i, _)| i)
-            {
-                hist.remove(oldest);
-            }
+            hist.truncate(NOTIFICATION_HISTORY_MAX);
         }
         self.shared.notification_posted(notification).await;
     }
@@ -3944,6 +4295,8 @@ impl Node {
     pub fn clear_all_local_data(&self) -> Result<()> {
         self.shared.clipboard_history.clear()?;
         *self.shared.last_clip_suggestion.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        lock(&self.shared.notification_history).clear();
+        self.shared.notifications.clear_all();
         self.shared.store.clear_all_history_and_cache()?;
         // Files waiting to send stay: they're only references, and the user
         // chose to send them. What's copied or linked goes with everything else.
@@ -4096,8 +4449,8 @@ impl Ports {
     }
 
     fn of(bound: &[SocketAddr]) -> Option<Ports> {
-        let v4 = bound.iter().find(|a| a.is_ipv4())?.port();
-        let v6 = bound.iter().find(|a| a.is_ipv6()).map(SocketAddr::port);
+        let v4 = bound.iter().find(|a| a.is_ipv4() && a.ip().is_unspecified())?.port();
+        let v6 = bound.iter().find(|a| a.is_ipv6() && a.ip().is_unspecified()).map(SocketAddr::port);
         Some(Ports { v4, v6 })
     }
 
@@ -4117,6 +4470,8 @@ async fn bind_endpoint(
     config: &NodeConfig,
     secret: iroh::SecretKey,
     ports: Option<Ports>,
+    relay_map: RelayMap,
+    proxy: Option<&url::Url>,
 ) -> Result<Endpoint> {
     let tuning = config.transport;
     let controller: std::sync::Arc<dyn iroh::endpoint::ControllerFactory + Send + Sync> = match tuning
@@ -4147,29 +4502,27 @@ async fn bind_endpoint(
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .alpns(vec![ALPN_SESSION.to_vec(), ALPN_PAIR.to_vec()])
+        // Keep a relay transport even in LAN mode, so it can be enabled later.
+        .relay_mode(RelayMode::Custom(relay_map))
         .transport_config(transport);
-    builder = if config.away_mode {
-        builder.relay_mode(RelayMode::Default)
-    } else {
-        // LAN only: no relays, nothing published outside the network, and no
-        // asking the router to open ports (UPnP, NAT-PMP, PCP) every few seconds.
-        // An empty relay map rather than none, so turning Away on later has a
-        // relay transport to fill: without one, only a restart could add relays.
-        builder
-            .relay_mode(RelayMode::Custom(iroh::RelayMap::empty()))
-            .portmapper_config(PortmapperConfig::Disabled)
-    };
+    if let Some(proxy) = proxy {
+        builder = builder.proxy_url(proxy.clone());
+    }
+    if !config.away_mode || ports.is_some() {
+        builder = builder.clear_ip_transports();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(name) = config.network_interface.as_deref().filter(|name| !name.is_empty()) {
+        builder = crate::direct_network::bind_lan_interface(builder, name, config.away_mode)?;
+    }
     if !config.away_mode {
         let v4_port = ports.map_or(0, |p| p.v4);
         builder = builder
-            .clear_ip_transports()
+            .portmapper_config(PortmapperConfig::Disabled)
             .bind_addr(SocketAddr::from(([0, 0, 0, 0], v4_port)))
             .map_err(crate::error::net)?;
     } else if let Some(ports) = ports {
-        builder = builder
-            .clear_ip_transports()
-            .bind_addr(SocketAddr::from(([0, 0, 0, 0], ports.v4)))
-            .map_err(crate::error::net)?;
+        builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], ports.v4))).map_err(crate::error::net)?;
         if let Some(v6) = ports.v6 {
             builder = builder.bind_addr(SocketAddr::from(([0u16; 8], v6))).map_err(crate::error::net)?;
         }
@@ -4181,6 +4534,25 @@ async fn bind_endpoint(
     Ok(endpoint)
 }
 
+/// Reconciles the live relay map. The caller holds `away_switch`.
+async fn apply_relays(shared: &Shared, away: bool) -> bool {
+    let desired = lock(&shared.relay_settings).enabled_map(away);
+    let mut changed = false;
+    for config in desired.relays::<Vec<_>>() {
+        if !shared.relay_map.contains(&config.url) {
+            shared.endpoint.insert_relay(config.url.clone(), config).await;
+            changed = true;
+        }
+    }
+    for url in shared.relay_map.urls::<Vec<_>>() {
+        if !desired.contains(&url) {
+            shared.endpoint.remove_relay(&url).await;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Brings relays and internet lookups in line with Away mode, while running.
 /// Off, nothing is published or looked up and no relay is picked or used. iroh
 /// keeps its idle connection to the current home relay until the endpoint
@@ -4188,17 +4560,7 @@ async fn bind_endpoint(
 async fn apply_internet_services(shared: &Arc<Shared>) {
     let _one_at_a_time = shared.away_switch.lock().await;
     let on = shared.away_mode();
-    let relays = RelayMode::Default.relay_map();
-    let urls: Vec<iroh::RelayUrl> = relays.urls();
-    for url in urls {
-        if on {
-            if let Some(config) = relays.get(&url) {
-                shared.endpoint.insert_relay(url, config).await;
-            }
-        } else {
-            shared.endpoint.remove_relay(&url).await;
-        }
-    }
+    apply_relays(shared, on).await;
     let running = lock(&shared.lan_discovery).as_ref().map(|(_, fast)| *fast);
     let lookups = match running {
         // Swapping mDNS clears the lookups and puts back what Away mode allows.
@@ -4645,7 +5007,6 @@ async fn deliver_queued_rpc(
 mod away_tests {
     use super::*;
     use crate::config::NoopPlatform;
-    use iroh::Watcher as _;
     use nectarlink_protocol::messages::{DeviceInfo, DeviceKind};
 
     async fn node(dir: &tempfile::TempDir, away: bool) -> Node {

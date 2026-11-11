@@ -13,19 +13,21 @@ use std::{
 
 use cxx_qt::{CxxQtThread, CxxQtType, Threading};
 use cxx_qt_lib::{
-    QHash, QHashPair_QString_QVariant, QList, QMap, QMapPair_QString_QVariant, QString, QVariant,
+    QHash, QHashPair_QString_QVariant, QList, QMap, QMapPair_QString_QVariant, QString, QStringList, QVariant,
 };
 use nectarlink_core::{DeviceId, Error, FeatureState, LinkState, PhoneToggleValue, features::Upgrade};
 
 use crate::{
     core_host,
     state::{Changes, CoreStatus},
-    win::{self, sound, tray},
+    win::{self, tray},
 };
 
 #[cxx_qt::bridge]
 pub mod qobject {
     unsafe extern "C++" {
+        include!("cxx-qt-lib/qstringlist.h");
+        type QStringList = cxx_qt_lib::QStringList;
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
         include!("cxx-qt-lib/qmap.h");
@@ -57,6 +59,7 @@ pub mod qobject {
         #[qproperty(i32, phone_toggles_revision)]
         /// Name of the device making this PC ring ("" when not ringing).
         #[qproperty(QString, ringing_from)]
+        #[qproperty(QStringList, ringing_devices)]
         #[qproperty(bool, system_dark)]
         #[qproperty(bool, reduce_motion)]
         /// Battery saver is on: decorative animation rests.
@@ -77,6 +80,8 @@ pub mod qobject {
         #[qproperty(QString, doctor_checks)]
         /// Checking, or fixing.
         #[qproperty(bool, doctor_busy)]
+        #[qproperty(QString, relay_probes)]
+        #[qproperty(bool, relay_check_busy)]
         /// This copy updates itself (it's installed).
         #[qproperty(bool, can_update)]
         /// A newer version that's available ("" when none).
@@ -364,6 +369,16 @@ pub mod qobject {
         /// Recomputes `data_retention_summary` from local stores and disk caches.
         #[qinvokable]
         fn refresh_data_retention(self: Pin<&mut AppController>);
+        #[qinvokable]
+        fn relay_snapshot(self: &AppController) -> QString;
+        #[qinvokable]
+        fn edit_relay(self: &AppController, url: &QString, action: &QString) -> QString;
+        #[qinvokable]
+        fn check_relays(self: Pin<&mut AppController>);
+        #[qinvokable]
+        fn network_interfaces(self: &AppController) -> QString;
+        #[qinvokable]
+        fn select_relay_interface(self: Pin<&mut AppController>, name: &QString) -> QString;
         /// Clears local notification history (in-memory, on-disk JSON, and cached notification images).
         #[qinvokable]
         fn clear_notification_history(self: Pin<&mut AppController>);
@@ -438,6 +453,7 @@ pub struct AppControllerRust {
     toggles_revision: i32,
     phone_toggles_revision: i32,
     ringing_from: QString,
+    ringing_devices: QStringList,
     system_dark: bool,
     reduce_motion: bool,
     power_saver: bool,
@@ -482,6 +498,10 @@ pub struct AppControllerRust {
     command_palette_results: QString,
     command_palette_open_ms: f64,
     data_retention_summary: QString,
+    relay_probes: QString,
+    relay_check_busy: bool,
+    relay_check_generation: u64,
+    relay_check_task: Option<tokio::task::AbortHandle>,
     localsend_enabled: bool,
     localsend_receiving: bool,
     localsend_peers_json: QString,
@@ -1190,6 +1210,7 @@ impl qobject::AppController {
             devices,
             phone_colors,
             ringing,
+            ringing_devices,
             online,
             current_is_online,
             caps_version,
@@ -1204,7 +1225,9 @@ impl qobject::AppController {
             wake_wired,
             waiting_count,
         ) = hub.read(|s| {
-            let ringing = s.ringing_from.and_then(|id| s.name_of(&id)).unwrap_or_default();
+            let ringing =
+                s.ringing_from.map(|id| s.name_of(&id).unwrap_or_else(|| id.short())).unwrap_or_default();
+            let ringing_devices = s.ringing_devices.iter().map(|id| QString::from(&id.to_string())).collect();
             let remote_prompt = s.remote_prompt.map(|id| {
                 let name = s.name_of(&id).unwrap_or_else(|| id.short());
                 (id.to_string(), name)
@@ -1245,6 +1268,7 @@ impl qobject::AppController {
                 s.devices.len(),
                 phone_colors,
                 ringing,
+                ringing_devices,
                 connected.len(),
                 current_is_online,
                 s.matrices_version,
@@ -1285,6 +1309,7 @@ impl qobject::AppController {
             self.as_mut().set_phone_colors(phone_colors_q);
         }
         self.as_mut().set_ringing_from(QString::from(&ringing));
+        self.as_mut().set_ringing_devices(ringing_devices);
         let (prompt_id, prompt_name) = remote_prompt.unwrap_or_default();
         self.as_mut().set_remote_prompt_device_id(QString::from(&prompt_id));
         self.as_mut().set_remote_prompt_device_name(QString::from(&prompt_name));
@@ -1591,10 +1616,9 @@ impl qobject::AppController {
     }
 
     pub fn stop_ringing(self: Pin<&mut Self>) {
-        sound::stop_ringing();
-        core_host::host()
-            .hub
-            .update(|s| if s.ringing_from.take().is_some() { Changes::RINGING } else { Changes::NONE });
+        if let Some(node) = core_host::node() {
+            core_host::spawn(async move { node.stop_ringing().await });
+        }
     }
 
     pub fn allow_remote_input(mut self: Pin<&mut Self>, device: &QString) {
@@ -1881,6 +1905,99 @@ impl qobject::AppController {
 
     pub fn refresh_data_retention(self: Pin<&mut Self>) {
         spawn_data_retention_refresh(self.qt_thread());
+    }
+
+    pub fn relay_snapshot(&self) -> QString {
+        let json = core_host::node().and_then(|node| serde_json::to_string(&node.relay_snapshot()).ok());
+        QString::from(json.as_deref().unwrap_or("null"))
+    }
+
+    pub fn edit_relay(&self, url: &QString, action: &QString) -> QString {
+        use nectarlink_core::relays::{RelayEdit, RelayEditError};
+        let Some(node) = core_host::node() else {
+            return QString::from("unavailable");
+        };
+        let action = match action.to_string().as_str() {
+            "add" => RelayEdit::Add,
+            "enable" => RelayEdit::Enable,
+            "disable" => RelayEdit::Disable,
+            "remove" => RelayEdit::Remove,
+            _ => return QString::from("failed"),
+        };
+        match node.edit_relay(&url.to_string(), action) {
+            Ok(()) => QString::default(),
+            Err(RelayEditError::InvalidAddress) => QString::from("invalid"),
+            Err(RelayEditError::Duplicate) => QString::from("duplicate"),
+            Err(RelayEditError::Limit) => QString::from("limit"),
+            Err(err) => {
+                tracing::warn!(%err, "can't save relay settings");
+                QString::from("failed")
+            }
+        }
+    }
+
+    pub fn network_interfaces(&self) -> QString {
+        #[cfg(target_os = "linux")]
+        {
+            let interfaces = nectarlink_core::direct_network::network_interfaces();
+            let json = serde_json::to_string(&interfaces).ok();
+            QString::from(json.as_deref().unwrap_or("[]"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        QString::from("[]")
+    }
+
+    pub fn select_relay_interface(self: Pin<&mut Self>, name: &QString) -> QString {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(node) = core_host::node() else { return QString::from("failed") };
+            match node.set_relay_interface(&name.to_string()) {
+                Ok(true) => {
+                    self.start_relay_check(node);
+                    QString::from("applied")
+                }
+                Ok(false) => QString::from("restart"),
+                Err(error) => {
+                    tracing::warn!(%error, "could not select relay network interface");
+                    QString::from("failed")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, name);
+            QString::from("failed")
+        }
+    }
+
+    pub fn check_relays(self: Pin<&mut Self>) {
+        if *self.relay_check_busy() {
+            return;
+        }
+        let Some(node) = core_host::node() else { return };
+        self.start_relay_check(node);
+    }
+
+    fn start_relay_check(mut self: Pin<&mut Self>, node: nectarlink_core::Node) {
+        if let Some(task) = self.as_mut().rust_mut().relay_check_task.take() {
+            task.abort();
+        }
+        let generation = self.rust().relay_check_generation.wrapping_add(1);
+        self.as_mut().rust_mut().relay_check_generation = generation;
+        self.as_mut().set_relay_probes(QString::default());
+        self.as_mut().set_relay_check_busy(true);
+        let qt = self.qt_thread();
+        let task = core_host::host().runtime.spawn(async move {
+            let results = serde_json::to_string(&node.check_relays().await).unwrap_or_default();
+            let _ = qt.queue(move |mut object| {
+                if object.rust().relay_check_generation != generation {
+                    return;
+                }
+                object.as_mut().set_relay_probes(QString::from(&results));
+                object.as_mut().set_relay_check_busy(false);
+            });
+        });
+        self.as_mut().rust_mut().relay_check_task = Some(task.abort_handle());
     }
 
     pub fn clear_notification_history(self: Pin<&mut Self>) {

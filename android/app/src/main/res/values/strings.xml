@@ -91,7 +91,7 @@
     <string name="local_network_title">Reach your PC on this network</string>
     <string name="local_network_text">Android asks before an app talks to devices on your network. NectarLink needs it to reach your PC.</string>
     <string name="channel_elevated">Wireless debugging setup</string>
-    <string name="elevated_title">Real touch and keys</string>
+    <string name="elevated_title">Elevated</string>
     <string name="elevated_not_set_up">Real-time touch, every key, and mute, hold and keypad on calls from your PC.</string>
     <string name="elevated_waiting">Waiting for Wireless debugging. Turn it on in Developer options.</string>
     <string name="elevated_starting">Starting…</string>
@@ -241,6 +241,9 @@
     <string name="star_channel">NectarLink project</string>
     <string name="star_title">Enjoying NectarLink?</string>
     <string name="star_text">Tap to star it on GitHub. It helps other people find it.</string>
+    <string name="support_title">Support NectarLink</string>
+    <string name="support_body">NectarLink is free and open source. If it makes your days a little easier, you can help keep it going. Thank you!</string>
+    <string name="support_action">Support</string>
     <string name="settings_comb_motion">Animated comb</string>
     <string name="settings_comb_motion_hint">The honeycomb breathes and pulses. It holds still with Remove animations or battery saver on.</string>
     <string name="theme_bloom">Bloom</string>
@@ -1397,6 +1400,37 @@
     <string name="device_name_in_profile">%1$s (%2$s)</string>
     <string name="profile_work">Work</string>
     <string name="profile_other">Second profile</string>
+    <string name="relay_settings_title">Iroh relay servers</string>
+    <string name="relay_waiting">Waiting for the connection service…</string>
+    <string name="relay_away_hint">Turn on Connect over mobile data to use your enabled relays.</string>
+    <string name="relay_selection_hint">The switches control which servers iroh can select as a home relay for this device.</string>
+    <string name="relay_home">Home relays</string>
+    <string name="relay_home_empty">No home relay selected</string>
+    <string name="relay_home_connected">Connected · %1$s</string>
+    <string name="relay_home_failed">Connection failed · %1$s</string>
+    <string name="relay_home_connecting">Connecting · %1$s</string>
+    <string name="relay_device_routes">Device traffic via relay</string>
+    <string name="relay_routes_empty">No device traffic routed through a relay</string>
+    <string name="relay_route">%1$s via %2$s</string>
+    <string name="relay_check_all">Check all relays</string>
+    <string name="relay_checking">Checking relays…</string>
+    <string name="relay_checking_short">Checking…</string>
+    <string name="relay_not_checked">Not checked</string>
+    <string name="relay_rtt">%1$d ms</string>
+    <string name="relay_timed_out">Timed out</string>
+    <string name="relay_unreachable">Unreachable</string>
+    <string name="relay_address">Custom relay address</string>
+    <string name="relay_add">Add relay</string>
+    <string name="relay_enable">Enable %1$s</string>
+    <string name="relay_invalid_address">Enter an HTTP or HTTPS relay address without credentials, a path or a query.</string>
+    <string name="relay_duplicate">This relay is already in the list.</string>
+    <string name="relay_limit">The list can hold up to 16 custom relays.</string>
+    <string name="relay_save_failed">Couldn’t save the relay settings.</string>
+    <string name="relay_region_na_east">North America · East</string>
+    <string name="relay_region_na_west">North America · West</string>
+    <string name="relay_region_europe">Europe</string>
+    <string name="relay_region_asia_pacific">Asia-Pacific</string>
+    <string name="relay_region_custom">Custom</string>
 </resources>
 
 

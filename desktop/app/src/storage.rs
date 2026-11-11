@@ -119,6 +119,9 @@ mod imp {
         stop_watcher: Arc<AtomicBool>,
         populated_dirs: Mutex<HashSet<String>>,
         uploading: Mutex<HashSet<String>>,
+        /// Placeholders being removed because the phone no longer has them: the
+        /// delete Windows reports for them mustn't reach the phone.
+        removing: Mutex<HashSet<String>>,
         /// The phone was connected at the last sync: its folder is re-read
         /// only when it comes back, not on every sync.
         online: AtomicBool,
@@ -126,6 +129,8 @@ mod imp {
 
     #[cfg(windows)]
     static ACTIVE_ROOTS: Mutex<Option<HashMap<DeviceId, Arc<ActiveRoot>>>> = Mutex::new(None);
+    #[cfg(windows)]
+    static INTERNED_DEVICES: Mutex<Option<HashMap<DeviceId, usize>>> = Mutex::new(None);
     #[cfg(windows)]
     static RECONCILING: Mutex<()> = Mutex::new(());
 
@@ -148,6 +153,14 @@ mod imp {
     /// Phones whose folder couldn't be registered, and when to try again.
     #[cfg(windows)]
     static FAILED: Mutex<Option<HashMap<DeviceId, RetryLater>>> = Mutex::new(None);
+
+    #[cfg(windows)]
+    fn intern_device_id(device: DeviceId) -> *const c_void {
+        let mut guard = lock(&INTERNED_DEVICES);
+        let map = guard.get_or_insert_with(HashMap::new);
+        let addr = *map.entry(device).or_insert_with(|| Box::into_raw(Box::new(device)) as usize);
+        addr as *const c_void
+    }
 
     #[cfg(windows)]
     fn active_roots() -> MutexGuard<'static, Option<HashMap<DeviceId, Arc<ActiveRoot>>>> {
@@ -716,9 +729,10 @@ mod imp {
             CF_CALLBACK_REGISTRATION { Type: CF_CALLBACK_TYPE_NONE, Callback: None },
         ];
 
-        // Keep the DeviceId in a heap allocation for the process lifetime so async
-        // cfapi callbacks always read a valid DeviceId and look up `ACTIVE_ROOTS`.
-        let ctx_ptr: *const c_void = Box::into_raw(Box::new(device)).cast();
+        // Keep one interned DeviceId allocation per paired device for the process
+        // lifetime so async cfapi callbacks always read a valid DeviceId and
+        // reconnects do not allocate a new Box each time.
+        let ctx_ptr = intern_device_id(device);
         let wide_root = to_wide_null(&root_path);
         // SAFETY: wide_root is null-terminated, callbacks ends with CF_CALLBACK_TYPE_NONE.
         let connection_key = unsafe {
@@ -740,6 +754,7 @@ mod imp {
             stop_watcher: stop_watcher.clone(),
             populated_dirs: Mutex::new(HashSet::new()),
             uploading: Mutex::new(HashSet::new()),
+            removing: Mutex::new(HashSet::new()),
             online: AtomicBool::new(online),
         });
 
@@ -1213,10 +1228,17 @@ mod imp {
                         Ok(()) => STATUS_SUCCESS,
                         Err(nectarlink_core::Error::Offline) => STATUS_CLOUD_NETWORK_UNAVAILABLE,
                         Err(nectarlink_core::Error::Denied) => STATUS_ACCESS_DENIED,
-                        Err(_) => STATUS_CLOUD_UNSUCCESSFUL,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "the phone couldn't move or rename a file");
+                            STATUS_CLOUD_UNSUCCESSFUL
+                        }
                     }
                 }
-                _ => STATUS_ACCESS_DENIED,
+                _ => {
+                    // Out of the phone's folder (the Recycle Bin, another drive) or onto it.
+                    tracing::warn!("a file can't be moved out of the phone's folder");
+                    STATUS_ACCESS_DENIED
+                }
             };
             ack_rename(connection_key, transfer_key, request_key, status);
         });
@@ -1253,6 +1275,11 @@ mod imp {
         core_host::spawn(async move {
             if rel_path.is_empty() {
                 ack_delete(connection_key, transfer_key, request_key, STATUS_ACCESS_DENIED);
+                return;
+            }
+            // Gone from the phone already: this is the app tidying up, not the user.
+            if lock(&root.removing).contains(&rel_path) {
+                ack_delete(connection_key, transfer_key, request_key, STATUS_SUCCESS);
                 return;
             }
             let Some(node) = core_host::node() else {
@@ -1310,6 +1337,12 @@ mod imp {
 
         lock(&root.populated_dirs).insert(rel_folder.to_owned());
 
+        // A full listing (it stops at MAX_LISTED otherwise) says what's no longer there.
+        if entries.len() < nectarlink_core::MAX_STORAGE_LISTED {
+            let on_phone: HashSet<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            remove_gone(&root, rel_folder, &local_dir, &on_phone);
+        }
+
         let mut missing: Vec<StorageEntry> = Vec::new();
         for entry in entries {
             // Windows can't show a name it can't store (`:`, `CON`, a trailing
@@ -1354,6 +1387,46 @@ mod imp {
                 Some(&mut processed),
             )
         };
+    }
+
+    /// Removes the placeholders in `local_dir` (the phone's `rel_folder`) for
+    /// what the phone no longer has. Only what's in sync goes: anything changed
+    /// or added on the PC that hasn't reached the phone yet stays, and so does
+    /// a folder holding some.
+    #[cfg(windows)]
+    fn remove_gone(root: &ActiveRoot, rel_folder: &str, local_dir: &Path, on_phone: &HashSet<&str>) {
+        let Ok(children) = std::fs::read_dir(local_dir) else { return };
+        for child in children.flatten() {
+            let name = child.file_name().to_string_lossy().into_owned();
+            if on_phone.contains(name.as_str()) || name.starts_with('.') || name.starts_with("~$") {
+                continue;
+            }
+            let path = child.path();
+            if !removable(&path) {
+                continue;
+            }
+            let rel = if rel_folder.is_empty() { name } else { format!("{rel_folder}/{name}") };
+            lock(&root.removing).insert(rel.clone());
+            let removed =
+                if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            if let Err(e) = removed {
+                tracing::debug!(error = %e, "can't remove a file the phone no longer has");
+            }
+            lock(&root.removing).remove(&rel);
+            lock(&root.populated_dirs).remove(&rel);
+        }
+    }
+
+    /// Whether `path` and everything under it only mirror the phone.
+    #[cfg(windows)]
+    fn removable(path: &Path) -> bool {
+        if needs_upload(path) {
+            return false;
+        }
+        if !path.is_dir() {
+            return true;
+        }
+        std::fs::read_dir(path).is_ok_and(|children| children.flatten().all(|c| removable(&c.path())))
     }
 
     /// Watches the sync root directory for files or folders dropped in by the user
@@ -1613,6 +1686,18 @@ mod imp {
             assert!(!root.exists(), "nothing kept: the folder goes");
         }
 
+        #[cfg(windows)]
+        #[test]
+        fn files_the_phone_never_had_are_never_removed_as_gone() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("Mine").join("deeper")).unwrap();
+            std::fs::write(dir.path().join("Mine").join("deeper").join("notes.txt"), b"mine").unwrap();
+            std::fs::write(dir.path().join("dropped.txt"), b"mine too").unwrap();
+            // Plain files and folders aren't placeholders: they're waiting to go to the phone.
+            assert!(!removable(&dir.path().join("dropped.txt")));
+            assert!(!removable(&dir.path().join("Mine")));
+        }
+
         #[test]
         fn converts_unix_ms_to_filetime_and_back() {
             let unix_ms = 1_710_000_000_123i64;
@@ -1694,6 +1779,21 @@ mod imp {
             assert_ne!(folders[&a].to_lowercase(), folders[&b].to_lowercase());
             // A phone with a name of its own keeps its plain folder.
             assert_eq!(folders[&c], "Pixel 9");
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn interns_callback_context_per_device_id() {
+            let (a, b) = (DeviceId([7; 32]), DeviceId([8; 32]));
+            let ptr_a1 = intern_device_id(a);
+            let ptr_a2 = intern_device_id(a);
+            let ptr_b = intern_device_id(b);
+            assert_eq!(ptr_a1, ptr_a2);
+            assert_ne!(ptr_a1, ptr_b);
+            unsafe {
+                assert_eq!(*(ptr_a1 as *const DeviceId), a);
+                assert_eq!(*(ptr_b as *const DeviceId), b);
+            }
         }
     }
 }

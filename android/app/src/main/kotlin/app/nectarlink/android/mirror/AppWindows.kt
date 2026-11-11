@@ -274,11 +274,15 @@ class AppWindows(
 
     companion object {
         private const val TAG = "AppWindows"
-        private const val NOTIFICATION_ID = 7
+        private const val NOTIFICATION_ID = 10
         /** Packets from the helper, at most. */
         private const val MAX_PACKET = 8 shl 20
 
         @Volatile private var instance: AppWindows? = null
+
+        fun closeAllCurrent() {
+            instance?.closeAll()
+        }
 
         /** The apps a PC may open in windows: launchable ones, by name, with small icons. */
         fun list(context: Context): List<PhoneApp> {
