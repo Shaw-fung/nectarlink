@@ -103,6 +103,12 @@ jobs:
           fi
 
   macos-intel:
+    # Intel (macos-13) runners are extremely scarce on GitHub's shared fleet and
+    # queue for hours, which trips GitHub's resource-abuse auto-disable. So this
+    # job is MANUAL ONLY (run via Actions -> macOS nightly -> Run workflow, with
+    # "force" checked). The automated pipeline never queues it, keeping the repo
+    # out of trouble; Apple Silicon (below) covers the automated macOS build.
+    if: github.event.inputs.force == 'true'
     name: macOS app (Intel)
     runs-on: macos-13
     timeout-minutes: 60
