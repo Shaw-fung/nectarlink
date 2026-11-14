@@ -23,6 +23,7 @@
 #include <QtGui/QImage>
 #include <QtGui/QPixmap>
 #include <QtGui/QPixmapCache>
+#include <QtGui/QSessionManager>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlEngine>
 #include <QtQuick/QQuickWindow>
@@ -189,6 +190,10 @@ void prepare_qt_without_log()
     QQuickWindow::setDefaultAlphaBuffer(true);
     qputenv("QT_QPA_DISABLE_REDIRECTION_SURFACE", "1");
     qputenv("QSG_RENDER_LOOP", "basic");
+    // With the basic loop, a frame after a resize often waited out the D3D
+    // swap chain's latency object (1 s), so dragging a window's edge stalled
+    // (a quarter of resize steps took ~1 s; none over 15 ms without it).
+    qputenv("QT_D3D_MAX_FRAME_LATENCY", "0");
     // Qt's V4 JS engine reserves 2 x QV4_JS_MAX_STACK_SIZE of committed RW
     // memory (8 MB by default). 512 KB per stack (1 MB total) is plenty for
     // UI bindings and saves 7 MB of private commit in the tray.
@@ -208,6 +213,19 @@ void add_app_icon_image(int32_t size, rust::Slice<const uint8_t> rgba)
 void apply_app_icon()
 {
     QGuiApplication::setWindowIcon(appIcon());
+}
+
+void stay_out_of_session_restore()
+{
+#if defined(__linux__) && QT_CONFIG(sessionmanager)
+    // Desktops that restore the last session (KDE Plasma, through XSMP) start
+    // every app that was open at logout again, without --minimized, so the
+    // window opened at login although the app starts in the tray. Start at
+    // login (the autostart entry) is what starts it with the session.
+    QObject::connect(qGuiApp, &QGuiApplication::saveStateRequest, qGuiApp, [](QSessionManager &manager) {
+        manager.setRestartHint(QSessionManager::RestartNever);
+    });
+#endif
 }
 
 void keep_running_without_windows()

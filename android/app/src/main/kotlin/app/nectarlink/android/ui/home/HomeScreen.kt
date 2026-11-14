@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -179,6 +180,7 @@ fun HomeScreen(
     onPairNew: () -> Unit,
     onRefresh: () -> Unit,
     onPower: (pcId: String, sleep: Boolean) -> Unit,
+    onHibernate: (pcId: String) -> Unit,
     onWake: (pcId: String) -> Unit,
     onSetReconnect: (pcId: String, on: Boolean) -> Unit,
     onRemote: (pcId: String) -> Unit,
@@ -670,6 +672,7 @@ fun HomeScreen(
                     onSendFiles = onSendFiles,
                     onSendFolder = onSendFolder,
                     onPower = onPower,
+                    onHibernate = onHibernate,
                     onWake = onWake,
                     onSetReconnect = onSetReconnect,
                     onRemote = onRemote,
@@ -1398,6 +1401,7 @@ private fun PeerCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun PcCard(
     device: Device,
@@ -1406,6 +1410,7 @@ private fun PcCard(
     onSendFiles: (String, List<Uri>) -> Unit,
     onSendFolder: (String, Uri) -> Unit,
     onPower: (String, Boolean) -> Unit,
+    onHibernate: (String) -> Unit,
     onWake: (String) -> Unit,
     onSetReconnect: (String, Boolean) -> Unit,
     onRemote: (String) -> Unit,
@@ -1457,30 +1462,39 @@ private fun PcCard(
             val outline = BorderStroke(1.dp, ink.copy(alpha = if (device.online) 0.45f else 0.15f))
             val statusDotColor = if (device.online) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
 
-            Row(
+            // The status keeps room to be read: with large fonts the buttons move
+            // to a line of their own rather than squeeze it a letter at a time.
+            FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                itemVerticalAlignment = Alignment.CenterVertically,
             ) {
-                Spacer(
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
-                        .size(10.dp)
-                        .padding(1.dp)
-                        .drawBehind { drawCircle(statusDotColor) },
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    if (!device.online && device.wakeState == WakeState.Waking) {
-                        stringResource(R.string.wake_waking, device.name)
-                    } else if (!device.online && !device.reconnect) {
-                        stringResource(R.string.link_not_reconnecting)
-                    } else {
-                        linkText(device.link)
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    modifier = Modifier.weight(1f),
-                )
-                if (!device.online && !device.reconnect) {
+                        .weight(1f)
+                        .widthIn(min = 132.dp),
+                ) {
+                    Spacer(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .padding(1.dp)
+                            .drawBehind { drawCircle(statusDotColor) },
+                    )
                     Spacer(Modifier.width(8.dp))
+                    Text(
+                        if (!device.online && device.wakeState == WakeState.Waking) {
+                            stringResource(R.string.wake_waking, device.name)
+                        } else if (!device.online && !device.reconnect) {
+                            stringResource(R.string.link_not_reconnecting)
+                        } else {
+                            linkText(device.link)
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                if (!device.online && !device.reconnect) {
                     FilledTonalButton(
                         colors = tonal,
                         onClick = { onSetReconnect(device.id, true) },
@@ -1494,7 +1508,6 @@ private fun PcCard(
                         )
                     }
                 } else if (!device.online && device.canWake && device.wakeState != WakeState.Waking) {
-                    Spacer(Modifier.width(8.dp))
                     FilledTonalButton(
                         colors = tonal,
                         onClick = { onWake(device.id) },
@@ -1511,7 +1524,6 @@ private fun PcCard(
                 // Stays paired, and stays disconnected until Reconnect (GitHub #48).
                 // At the end of the status line, outlined so it reads as a button.
                 if (device.reconnect && device.wakeState != WakeState.Waking) {
-                    Spacer(Modifier.width(8.dp))
                     OutlinedButton(
                         onClick = { onSetReconnect(device.id, false) },
                         border = BorderStroke(1.dp, ink.copy(alpha = 0.35f)),
@@ -1806,6 +1818,19 @@ private fun PcCard(
                             modifier = Modifier.weight(1f),
                         ) {
                             ButtonLabel(stringResource(R.string.action_sleep_pc))
+                        }
+                        // Only for a PC that can hibernate right now (#355).
+                        if (device.has("device.pc_hibernate")) {
+                            OutlinedButton(
+                                contentPadding = CardButtonPadding,
+                                enabled = device.online,
+                                colors = outlined,
+                                border = outline,
+                                onClick = { onHibernate(device.id) },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                ButtonLabel(stringResource(R.string.action_hibernate_pc))
+                            }
                         }
                     }
                 }

@@ -2503,6 +2503,8 @@ impl Event {
             | NodeEvent::CameraCaptureReceived { .. }
             | NodeEvent::CameraCaptureCancelled { .. }
             | NodeEvent::PcMirrorRequested { .. }
+            // Shown on PCs only.
+            | NodeEvent::MirrorNotice { .. }
             // A phone's microphone arrives on PCs only.
             | NodeEvent::Mic { .. } => return None,
             NodeEvent::RemoteInputRequested { device } => {
@@ -2750,8 +2752,9 @@ pub trait Platform: Send + Sync {
     fn mirror_stop_requested(&self, pc_id: String, session: u32);
     /// The PC needs a keyframe.
     fn mirror_keyframe_requested(&self, pc_id: String, session: u32);
-    /// The PC resized an app window (`session` != 0) to `width × height`.
-    fn mirror_resize_requested(&self, pc_id: String, session: u32, width: u32, height: u32);
+    /// The PC resized an app window (`session` != 0) to `width × height`,
+    /// the app drawing at `zoom` percent of its usual size.
+    fn mirror_resize_requested(&self, pc_id: String, session: u32, width: u32, height: u32, zoom: u32);
     /// The PC updated `stay_awake` or `screen_off` while mirroring the screen (`session == 0`).
     fn mirror_power_requested(&self, pc_id: String, stay_awake: bool, screen_off: bool);
     /// The PC wants the phone's sound sent to it, or left on the phone, while
@@ -2976,8 +2979,8 @@ impl core::Platform for PlatformAdapter {
     fn mirror_keyframe_requested(&self, peer: &DeviceId, session: u32) {
         self.0.mirror_keyframe_requested(peer.to_string(), session);
     }
-    fn mirror_resize_requested(&self, peer: &DeviceId, session: u32, width: u32, height: u32) {
-        self.0.mirror_resize_requested(peer.to_string(), session, width, height);
+    fn mirror_resize_requested(&self, peer: &DeviceId, session: u32, width: u32, height: u32, zoom: u32) {
+        self.0.mirror_resize_requested(peer.to_string(), session, width, height, zoom);
     }
     fn mirror_power_requested(&self, peer: &DeviceId, stay_awake: bool, screen_off: bool) {
         self.0.mirror_power_requested(peer.to_string(), stay_awake, screen_off);
@@ -4093,6 +4096,13 @@ impl NectarlinkNode {
         self.run(async move { Ok(node.pc_power(id, action).await?) }).await
     }
 
+    /// Hibernates a paired PC (only one that offers `pc.power.hibernate`).
+    pub async fn pc_hibernate(&self, id: String) -> Result<()> {
+        let id = parse_id(&id)?;
+        let node = self.node.clone();
+        self.run(async move { Ok(node.pc_power(id, core::PowerAction::Hibernate).await?) }).await
+    }
+
     /// Sends Wake-on-LAN magic packets for a paired PC over UDP to its stored
     /// subnet broadcasts and `255.255.255.255` on ports 9 and 7, repeated a
     /// few times over ~2 s.
@@ -4276,6 +4286,18 @@ impl NectarlinkNode {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
         self.run(async move { Ok(Arc::new(MirrorStream(node.mirror_open_audio(id).await?))) }).await
+    }
+
+    /// The Elevated helper's taps and keys are refused by this phone (Xiaomi,
+    /// until USB debugging (Security settings) is on): tells the PC showing
+    /// mirroring `session`, so it can say what to turn on.
+    pub async fn mirror_input_blocked(&self, pc_id: String, session: u32) -> Result<()> {
+        let id = parse_id(&pc_id)?;
+        let node = self.node.clone();
+        self.run(async move {
+            node.mirror_notice(id, session, core::MIRROR_NOTICE_INPUT_BLOCKED).await.map_err(Into::into)
+        })
+        .await
     }
 
     /// Tells a paired PC that mirroring or remote keyboard input on `session` has stopped (`mirror.stop`).

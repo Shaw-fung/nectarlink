@@ -1571,6 +1571,14 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * Automatically sends non-sensitive text copied in the background while Elevated mode is running.
      * Skips clips NectarLink itself wrote from a PC (`PhoneClipboard.isRecentEcho`).
      */
+    /** Elevated's taps are refused: tells the PC that sent the last ones what to turn on. */
+    fun onElevatedInputBlocked() {
+        val (pcId, session) = PhonePlatform.lastMirrorInput ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching { node?.mirrorInputBlocked(pcId, session) }
+        }
+    }
+
     fun onElevatedClipboardChanged(text: String, html: String?) {
         if (text.isBlank() || PhoneClipboard.isRecentEcho(text, html)) return
         val now = android.os.SystemClock.elapsedRealtime()
@@ -2125,6 +2133,22 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
             val message = try {
                 node.pcPower(id, sleep)
                 context.getString(if (sleep) R.string.pc_sleeping else R.string.pc_locked, name)
+            } catch (e: NectarlinkException) {
+                if (e is NectarlinkException.Denied) context.getString(R.string.pc_actions_off, name) else describe(e)
+            }
+            _messages.tryEmit(message)
+        }
+    }
+
+    /** Hibernates a PC that can (#355); says how it went. */
+    fun pcHibernate(id: String) {
+        scope.launch {
+            startJob?.join()
+            val node = node ?: return@launch
+            val name = _state.value.nameOf(id).orEmpty()
+            val message = try {
+                node.pcHibernate(id)
+                context.getString(R.string.pc_hibernating, name)
             } catch (e: NectarlinkException) {
                 if (e is NectarlinkException.Denied) context.getString(R.string.pc_actions_off, name) else describe(e)
             }

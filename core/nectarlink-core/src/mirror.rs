@@ -25,8 +25,8 @@ use iroh::endpoint::{RecvStream, SendStream, VarInt};
 use nectarlink_protocol::{
     DeviceId, Envelope, ErrorCode, PacketKind,
     messages::{
-        MirrorAudioConfig, MirrorConfig, MirrorInput, MirrorPower, MirrorResize, MirrorSession, MirrorSound,
-        MirrorStart, PhoneApp, PhoneApps, StreamHeader, mirror, types,
+        MirrorAudioConfig, MirrorConfig, MirrorInput, MirrorNotice, MirrorPower, MirrorResize, MirrorSession,
+        MirrorSound, MirrorStart, PhoneApp, PhoneApps, StreamHeader, mirror, types,
     },
     read_video_packet, video_packet_header, write_frame,
 };
@@ -119,6 +119,15 @@ pub(crate) async fn start(shared: &Shared, session: &Session, options: MirrorSta
     Ok(())
 }
 
+/// Tells the PC something about its mirroring (`mirror.notice`), by `code`.
+pub(crate) async fn notice(session: &Session, mirroring: u32, code: &str) -> Result<()> {
+    let body = MirrorNotice { session: mirroring, code: code.to_owned() };
+    if !body.is_valid() {
+        return Err(Error::Protocol("invalid mirror notice".into()));
+    }
+    session.send(Envelope::new(types::MIRROR_NOTICE, &body)?).await
+}
+
 pub(crate) async fn stop(session: &Session, mirroring: u32) -> Result<()> {
     let env = Envelope::new(types::MIRROR_STOP, &MirrorSession { session: mirroring })?;
     session.request(env, crate::session::REQUEST_TIMEOUT).await?.expect(types::OK)?;
@@ -166,11 +175,12 @@ pub(crate) async fn resize(
     mirroring: u32,
     width: u32,
     height: u32,
+    zoom: u32,
 ) -> Result<()> {
     if !shared.toggle_on(&session.peer, TOGGLE) {
         return Err(Error::Denied);
     }
-    let msg = MirrorResize { session: mirroring, width, height };
+    let msg = MirrorResize { session: mirroring, width, height, zoom };
     if !msg.is_valid() {
         return Err(Error::Protocol("invalid resize".into()));
     }
@@ -449,6 +459,16 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             tokio::task::spawn_blocking(move || platform.mirror_stop_requested(&peer, mirroring));
             session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
         }
+        types::MIRROR_NOTICE => {
+            let notice: MirrorNotice = env.body()?;
+            if notice.is_valid() && shared.we_offer(mirror::VIEW) {
+                shared.emit(NodeEvent::MirrorNotice {
+                    device: peer,
+                    session: notice.session,
+                    code: notice.code,
+                });
+            }
+        }
         types::MIRROR_KEYFRAME => {
             let MirrorSession { session: mirroring } = env.body()?;
             tokio::task::spawn_blocking(move || platform.mirror_keyframe_requested(&peer, mirroring));
@@ -458,7 +478,13 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             let allowed = shared.toggle_on(&peer, TOGGLE) && shared.we_offer(mirror::VIRTUAL_DISPLAY);
             if allowed && resize.is_valid() {
                 tokio::task::spawn_blocking(move || {
-                    platform.mirror_resize_requested(&peer, resize.session, resize.width, resize.height);
+                    platform.mirror_resize_requested(
+                        &peer,
+                        resize.session,
+                        resize.width,
+                        resize.height,
+                        resize.zoom,
+                    );
                 });
             }
         }

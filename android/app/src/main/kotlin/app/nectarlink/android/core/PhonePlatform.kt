@@ -188,16 +188,19 @@ internal class PhonePlatform(
     override fun mirrorKeyframeRequested(pcId: String, session: UInt) =
         if (session == SCREEN) MirrorService.keyframe(pcId) else appWindows.keyframe(pcId, session)
 
-    override fun mirrorResizeRequested(pcId: String, session: UInt, width: UInt, height: UInt) {
-        if (session != SCREEN) appWindows.resize(pcId, session, width.toInt(), height.toInt())
+    override fun mirrorResizeRequested(pcId: String, session: UInt, width: UInt, height: UInt, zoom: UInt) {
+        if (session != SCREEN) appWindows.resize(pcId, session, width.toInt(), height.toInt(), zoom.toInt())
     }
 
     // Real events when Elevated runs; gestures through the accessibility service otherwise.
     override fun mirrorInput(pcId: String, session: UInt, requested: MirrorInputEvent) {
+        lastMirrorInput = pcId to session
         // Send needs the accessibility service. Without it, it's a plain Enter.
         var input = requested
         if (requested is MirrorInputEvent.Key && requested.key == "send") {
-            if (InputService.pressSend()) return
+            // An app window's box is on that window's display, not the screen's (#220).
+            val display = if (session == SCREEN) null else appWindows.displayOf(pcId, session)
+            if ((session == SCREEN || display != null) && InputService.pressSend(display)) return
             input = MirrorInputEvent.Key("enter")
         }
         if (session != SCREEN) return appWindows.input(pcId, session, input)
@@ -331,8 +334,11 @@ internal class PhonePlatform(
         return ActivityOptions.makeBasic().setPendingIntentBackgroundActivityStartMode(mode).toBundle()
     }
 
-    private companion object {
+    companion object {
+        /** Which PC and mirroring sent the last taps and keys, for telling it they were refused. */
+        @Volatile var lastMirrorInput: Pair<String, UInt>? = null
+
         /** The phone's own screen's mirroring session. */
-        const val SCREEN = 0u
+        private const val SCREEN = 0u
     }
 }

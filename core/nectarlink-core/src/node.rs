@@ -3134,10 +3134,18 @@ impl Node {
         }
     }
 
-    /// Resizes an app window's display (`mirroring` != 0) on a phone.
-    pub async fn mirror_resize(&self, peer: DeviceId, mirroring: u32, width: u32, height: u32) -> Result<()> {
+    /// Resizes an app window's display (`mirroring` != 0) on a phone; the app
+    /// draws at `zoom` percent of its usual size (100: as it is).
+    pub async fn mirror_resize(
+        &self,
+        peer: DeviceId,
+        mirroring: u32,
+        width: u32,
+        height: u32,
+        zoom: u32,
+    ) -> Result<()> {
         let session = self.connected(&peer)?;
-        crate::mirror::resize(&self.shared, &session, mirroring, width, height).await
+        crate::mirror::resize(&self.shared, &session, mirroring, width, height, zoom).await
     }
 
     /// Updates `stay_awake` and `screen_off` while mirroring a phone's screen (`session == 0`).
@@ -3161,6 +3169,13 @@ impl Node {
     ) -> Result<()> {
         let session = self.connected(&peer)?;
         crate::mirror::input(&self.shared, &session, mirroring, input).await
+    }
+
+    /// Tells a PC something about its mirroring, by `code` (`mirror.notice`):
+    /// say, that this phone refuses its taps.
+    pub async fn mirror_notice(&self, peer: DeviceId, mirroring: u32, code: &str) -> Result<()> {
+        let session = self.connected(&peer)?;
+        crate::mirror::notice(&session, mirroring, code).await
     }
 
     /// The apps a phone can open in windows of their own (Elevated), by name.
@@ -4746,6 +4761,61 @@ fn is_mdns_interface(ip: std::net::Ipv4Addr) -> bool {
         && !ip.is_link_local()
         && !ip.is_unspecified()
         && !crate::session::is_tailnet_ip(std::net::IpAddr::V4(ip))
+        && carries_multicast(ip)
+}
+
+/// On Linux, also leave out interfaces without the MULTICAST flag, such as
+/// WireGuard and other point-to-point tunnels: every mDNS send on them fails
+/// (WireGuard answers ENOKEY), and swarm-discovery logs an error for each one
+/// on every round.
+#[cfg(target_os = "linux")]
+fn carries_multicast(ip: std::net::Ipv4Addr) -> bool {
+    interface_carries_multicast(ip, &netdev::get_interfaces())
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "android")))]
+fn carries_multicast(_ip: std::net::Ipv4Addr) -> bool {
+    true
+}
+
+/// An address no interface reports (it may just have gone away) stays in, as
+/// before this check.
+#[cfg(target_os = "linux")]
+fn interface_carries_multicast(ip: std::net::Ipv4Addr, interfaces: &[netdev::Interface]) -> bool {
+    interfaces
+        .iter()
+        .find(|nic| nic.ipv4.iter().any(|net| net.addr() == ip))
+        .is_none_or(netdev::Interface::is_multicast)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mdns_interface_tests {
+    use super::interface_carries_multicast;
+    use std::net::Ipv4Addr;
+
+    fn nic(addr: Ipv4Addr, flags: libc::c_int) -> netdev::Interface {
+        let mut nic = netdev::Interface::dummy();
+        nic.ipv4 = vec![netdev::ipnet::Ipv4Net::new(addr, 24).unwrap()];
+        nic.flags = flags as u32;
+        nic
+    }
+
+    #[test]
+    fn point_to_point_tunnels_without_multicast_are_left_out() {
+        let lan = Ipv4Addr::new(192, 168, 0, 222);
+        let wireguard = Ipv4Addr::new(10, 99, 99, 132);
+        let interfaces = [
+            nic(lan, libc::IFF_UP | libc::IFF_BROADCAST | libc::IFF_MULTICAST | libc::IFF_RUNNING),
+            nic(wireguard, libc::IFF_UP | libc::IFF_POINTOPOINT | libc::IFF_NOARP | libc::IFF_RUNNING),
+        ];
+        assert!(interface_carries_multicast(lan, &interfaces));
+        assert!(!interface_carries_multicast(wireguard, &interfaces));
+    }
+
+    #[test]
+    fn unknown_addresses_stay_in() {
+        assert!(interface_carries_multicast(Ipv4Addr::new(10, 0, 0, 5), &[]));
+    }
 }
 
 /// The internet lookups away mode uses, the same ones `bind_endpoint` sets

@@ -174,6 +174,9 @@ pub struct Shown {
     /// For an app window: the app's name, and its package.
     pub app: Option<String>,
     pub pkg: Option<String>,
+    /// Stopped to start again (flexible display turned off): its stream's
+    /// end starts it again instead of ending the window.
+    pub restarting: bool,
 }
 
 /// A phone's apps that open in windows.
@@ -209,6 +212,14 @@ struct SavedWindows {
     /// Keyed by `<device>`, most recently opened `pkg` first.
     #[serde(default)]
     recent: HashMap<String, Vec<String>>,
+    /// `<device>/<pkg>` of app windows kept at the phone's resolution (flexible
+    /// display off): their display doesn't follow the window's size.
+    #[serde(default)]
+    fixed: HashSet<String>,
+    /// `<device>/<pkg>` to how big the app draws in its window, in percent
+    /// (Ctrl + mouse wheel); missing is 100.
+    #[serde(default)]
+    zoom: HashMap<String, u32>,
 }
 
 impl SavedWindows {
@@ -250,7 +261,7 @@ struct State {
     screen_off: HashSet<DeviceId>,
     /// Phone currently receiving PC keyboard input without screen mirroring.
     keyboard_device: Option<DeviceId>,
-    /// Short transient feedback notices per mirror window: `(text, shown_at, token)`.
+    /// Short transient feedback notices per mirror window: `(text, shown_until, token)`.
     notices: HashMap<Window, (String, Instant, u64)>,
     apps: HashMap<DeviceId, Apps>,
     saved: SavedWindows,
@@ -439,25 +450,29 @@ pub fn remember_screen_off(device: DeviceId, on: bool) {
     core_host::host().hub.changed(Changes::MIRROR);
 }
 
-/// Short status banner for `window` if shown within the last 3 seconds.
+/// The status banner for `window`, while it's up.
 pub fn last_notice(window: &Window) -> String {
     state(|s| {
         s.notices
             .get(window)
-            .filter(|(_, at, _)| at.elapsed() < NOTICE_DURATION)
+            .filter(|(_, until, _)| Instant::now() < *until)
             .map(|(text, _, _)| text.clone())
             .unwrap_or_default()
     })
 }
 
 fn set_notice(window: Window, text: impl Into<String>) {
+    set_notice_for(window, text, NOTICE_DURATION);
+}
+
+fn set_notice_for(window: Window, text: impl Into<String>, duration: Duration) {
     let token = NOTICE_SEQ.fetch_add(1, Ordering::Relaxed);
     state(|s| {
-        s.notices.insert(window, (text.into(), Instant::now(), token));
+        s.notices.insert(window, (text.into(), Instant::now() + duration, token));
     });
     core_host::host().hub.changed(Changes::MIRROR);
     core_host::spawn(async move {
-        tokio::time::sleep(NOTICE_DURATION).await;
+        tokio::time::sleep(duration).await;
         let cleared = state(|s| {
             if s.notices.get(&window).is_some_and(|(_, _, t)| *t == token) {
                 s.notices.remove(&window);
@@ -814,18 +829,147 @@ pub fn windows() -> Vec<(Window, Shown)> {
     all
 }
 
-/// Remembered window position and size for `(device, pkg)`.
+/// Where the phone's own screen keeps its window's place and size, beside its
+/// apps': not a package name, so no app can have it.
+pub const SCREEN_GEOMETRY: &str = "#screen";
+
+/// Remembered window position and size for `(device, pkg)` (or the phone's
+/// screen, [`SCREEN_GEOMETRY`]).
 pub fn geometry(device: &DeviceId, pkg: &str) -> Option<WindowGeometry> {
     state(|s| s.saved.geometry.get(&format!("{device}/{pkg}")).copied())
 }
 
-/// Saves an app window's position and size on this PC.
-pub fn save_geometry(window: Window, x: i32, y: i32, width: u32, height: u32) {
-    if window.session == MIRROR_SCREEN || width < 200 || height < 200 {
+/// Whether an app window's display follows the window's size (on unless
+/// turned off for its app).
+pub fn flexible(window: &Window) -> bool {
+    window.session != MIRROR_SCREEN
+        && state(|s| {
+            let pkg = s.windows.get(window).and_then(|w| w.pkg.clone());
+            pkg.is_none_or(|pkg| !s.saved.fixed.contains(&format!("{}/{pkg}", window.device)))
+        })
+}
+
+/// Turns an app window's flexible display on or off, for its app. Off, the
+/// app starts again on a display of the phone's resolution; on, the window's
+/// next resize (which the window sends) gives the display its size.
+pub fn set_flexible(window: Window, on: bool) {
+    if window.session == MIRROR_SCREEN || flexible(&window) == on {
         return;
     }
     state(|s| {
         let Some(pkg) = s.windows.get(&window).and_then(|w| w.pkg.clone()) else { return };
+        let key = format!("{}/{pkg}", window.device);
+        if on {
+            s.saved.fixed.remove(&key);
+        } else {
+            s.saved.fixed.insert(key);
+        }
+        s.saved.save();
+    });
+    core_host::host().hub.changed(Changes::MIRROR);
+    if !on {
+        restart(window);
+    }
+}
+
+/// Starts an app window's app again on a new display. The phone takes the
+/// same session for the new one, so the old one is stopped first and the
+/// new asked for once it has ended (or after a while, if no end arrives):
+/// otherwise the old stream's end ended the new window.
+fn restart(window: Window) {
+    let started = state(|s| {
+        let shown = s.windows.get_mut(&window)?;
+        shown.restarting = true;
+        shown.phase = Phase::Asking;
+        Some(())
+    });
+    if started.is_none() {
+        return;
+    }
+    stop_recording(window);
+    clear_window_buffers(&window);
+    ffi::video_clear(&window.key());
+    core_host::host().hub.changed(Changes::MIRROR);
+    let Some(node) = core_host::node() else { return };
+    core_host::spawn(async move {
+        node.mirror_stop(window.device, window.session).await;
+        tokio::time::sleep(RESTART_FALLBACK).await;
+        finish_restart(window);
+    });
+}
+
+/// How long a restart waits for the old stream's end before asking anyway.
+const RESTART_FALLBACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Asks for a restarting window again, once (its old stream ended, or the
+/// fallback ran out); false if it isn't restarting.
+fn finish_restart(window: Window) -> bool {
+    let was =
+        state(|s| s.windows.get_mut(&window).is_some_and(|w| std::mem::replace(&mut w.restarting, false)));
+    if was {
+        reopen(window);
+    }
+    was
+}
+
+/// How big an app window's app draws, in percent (100 unless changed).
+pub fn zoom(window: &Window) -> u32 {
+    state(|s| {
+        let pkg = s.windows.get(window).and_then(|w| w.pkg.as_deref())?;
+        s.saved.zoom.get(&format!("{}/{pkg}", window.device)).copied()
+    })
+    .unwrap_or(100)
+}
+
+/// One step of zoom.
+const ZOOM_STEP: u32 = 10;
+
+/// `zoom` moved by `steps` of the mouse wheel, within what the phone takes.
+fn zoomed(zoom: u32, steps: i32) -> u32 {
+    let range = nectarlink_core::MirrorResize::ZOOM;
+    zoom.saturating_add_signed(steps.saturating_mul(ZOOM_STEP as i32)).clamp(*range.start(), *range.end())
+}
+
+/// Makes an app window's app draw bigger or smaller, for its app, by `steps`
+/// of the mouse wheel; the window then applies it (`resize`, or
+/// `zoom_display` when it isn't flexible). False when nothing changed (it's
+/// at its limit already).
+pub fn change_zoom(window: Window, steps: i32) -> bool {
+    let old = zoom(&window);
+    let new = zoomed(old, steps);
+    if new == old {
+        return false;
+    }
+    let saved = state(|s| {
+        let pkg = s.windows.get(&window).and_then(|w| w.pkg.clone())?;
+        let key = format!("{}/{pkg}", window.device);
+        if new == 100 {
+            s.saved.zoom.remove(&key);
+        } else {
+            s.saved.zoom.insert(key, new);
+        }
+        s.saved.save();
+        Some(())
+    });
+    if saved.is_some() {
+        set_notice(window, format!("{new}%"));
+    }
+    saved.is_some()
+}
+
+/// Saves a window's position and size on this PC: an app's, or the phone
+/// screen's (#358), which the next one opens at.
+pub fn save_geometry(window: Window, x: i32, y: i32, width: u32, height: u32) {
+    if width < 200 || height < 200 {
+        return;
+    }
+    state(|s| {
+        let pkg = if window.session == MIRROR_SCREEN {
+            Some(SCREEN_GEOMETRY.to_owned())
+        } else {
+            s.windows.get(&window).and_then(|w| w.pkg.clone())
+        };
+        let Some(pkg) = pkg else { return };
         let key = format!("{}/{pkg}", window.device);
         let geom = WindowGeometry { x, y, width, height };
         if s.saved.geometry.insert(key, geom) != Some(geom) {
@@ -886,6 +1030,36 @@ fn power(s: &State, device: &DeviceId) -> (bool, bool) {
     (s.stay_awake.contains(device), s.screen_off.contains(device))
 }
 
+/// The Android release in a phone's OS version (`"17.1"` → 17).
+fn android_release(os_ver: &str) -> Option<u32> {
+    os_ver.split('.').next()?.trim().parse().ok()
+}
+
+/// An app window keeps running while the phone sleeps from Android 14 on
+/// (its display is in a power group of its own, the helper's `VirtualDevice`),
+/// so keeping the phone awake or its screen off does nothing for it. Unknown
+/// versions count as older.
+fn runs_asleep(android: Option<u32>) -> bool {
+    android.is_some_and(|v| v >= 14)
+}
+
+/// Whether the phone's power matters to `window`: its screen always, an app
+/// window only where it sleeps with the phone. Where it doesn't, the window
+/// has no power buttons and asks nothing of the phone's power.
+pub fn power_matters(window: &Window) -> bool {
+    window.session == MIRROR_SCREEN
+        || !runs_asleep(
+            core_host::host()
+                .hub
+                .read(|s| s.device(&window.device).and_then(|d| android_release(&d.info.os_ver))),
+        )
+}
+
+/// [`power`] for an app window: nothing where the phone's power doesn't matter to it.
+fn app_power(window: &Window) -> (bool, bool) {
+    if power_matters(window) { state(|s| power(s, &window.device)) } else { (false, false) }
+}
+
 /// Asks the phone for its screen.
 pub fn start(device: DeviceId) {
     if keyboard_device() == Some(device) {
@@ -896,7 +1070,7 @@ pub fn start(device: DeviceId) {
     let (stay_awake, screen_off) = state(|s| {
         // The phone's screen starts as it's set to, unless app windows already turned it off.
         s.reset_screen_off(&device);
-        s.windows.insert(window, Shown { phase: Phase::Asking, app: None, pkg: None });
+        s.windows.insert(window, Shown { phase: Phase::Asking, app: None, pkg: None, restarting: false });
         power(s, &device)
     });
     let options = screen_options(crate::settings::mirror_quality(), on_relay(&device));
@@ -993,10 +1167,14 @@ pub fn start_app(device: DeviceId, pkg: String, label: String) {
         let window =
             ended.unwrap_or_else(|| Window { device, session: NEXT_SESSION.fetch_add(1, Ordering::Relaxed) });
         s.reset_screen_off(&device);
-        s.windows.insert(window, Shown { phase: Phase::Asking, app: Some(label), pkg: Some(pkg.clone()) });
-        Some((window, power(s, &device)))
+        s.windows.insert(
+            window,
+            Shown { phase: Phase::Asking, app: Some(label), pkg: Some(pkg.clone()), restarting: false },
+        );
+        Some(window)
     });
-    let Some((window, (stay_awake, screen_off))) = window else { return };
+    let Some(window) = window else { return };
+    let (stay_awake, screen_off) = app_power(&window);
     let options = app_options(crate::settings::mirror_quality(), on_relay(&device));
     ffi::video_clear(&window.key());
     request(
@@ -1024,9 +1202,10 @@ pub fn reopen(window: Window) {
         let pkg = shown.pkg.clone()?;
         shown.phase = Phase::Asking;
         record_recent(s, &window.device, &pkg);
-        Some((pkg, power(s, &window.device)))
+        Some(pkg)
     });
-    let Some((pkg, (stay_awake, screen_off))) = pkg else { return };
+    let Some(pkg) = pkg else { return };
+    let (stay_awake, screen_off) = app_power(&window);
     let options = app_options(crate::settings::mirror_quality(), on_relay(&window.device));
     ffi::video_clear(&window.key());
     request(
@@ -1045,7 +1224,7 @@ pub fn reopen(window: Window) {
 /// Resizes an app window's display on the phone (`width` and `height` are the
 /// window's logical dimensions on the PC).
 pub fn resize(window: Window, width: u32, height: u32) {
-    if window.session == MIRROR_SCREEN || width < 120 || height < 120 {
+    if window.session == MIRROR_SCREEN || width < 120 || height < 120 || !flexible(&window) {
         return;
     }
     let (mut w, mut h) = (width.saturating_mul(2), height.saturating_mul(2));
@@ -1056,10 +1235,27 @@ pub fn resize(window: Window, width: u32, height: u32) {
     }
     let w = (w & !1).clamp(240, 4096);
     let h = (h & !1).clamp(240, 4096);
+    let zoom = zoom(&window);
     let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
-        if let Err(e) = node.mirror_resize(window.device, window.session, w, h).await {
+        if let Err(e) = node.mirror_resize(window.device, window.session, w, h, zoom).await {
             tracing::debug!(error = %e, "resize didn't reach the phone");
+        }
+    });
+}
+
+/// Applies an app window's zoom to a display that keeps its size (flexible
+/// display off): `width` x `height` are the picture's own pixels, so the
+/// phone changes nothing but how big the app draws.
+pub fn zoom_display(window: Window, width: u32, height: u32) {
+    if window.session == MIRROR_SCREEN || flexible(&window) {
+        return;
+    }
+    let zoom = zoom(&window);
+    let Some(node) = core_host::node() else { return };
+    core_host::spawn(async move {
+        if let Err(e) = node.mirror_resize(window.device, window.session, width, height, zoom).await {
+            tracing::debug!(error = %e, "zoom didn't reach the phone");
         }
     });
 }
@@ -1144,6 +1340,22 @@ mod quality_tests {
     use super::*;
 
     #[test]
+    fn app_windows_from_android_14_run_while_the_phone_sleeps() {
+        assert!(runs_asleep(android_release("17.1")));
+        assert!(runs_asleep(android_release("14")));
+        assert!(!runs_asleep(android_release("13")));
+        assert!(!runs_asleep(android_release("")));
+    }
+
+    #[test]
+    fn zoom_moves_in_steps_and_stops_at_what_the_phone_takes() {
+        assert_eq!(zoomed(100, 1), 110);
+        assert_eq!(zoomed(100, -2), 80);
+        assert_eq!(zoomed(190, 3), 200);
+        assert_eq!(zoomed(60, -5), 50);
+    }
+
+    #[test]
     fn app_windows_apply_smoother_and_keep_android_size_limits() {
         let smoother = app_options(Quality::Smoother, false);
         assert_eq!((smoother.max_size, smoother.bitrate, smoother.fps), (1280, 4_000_000, 60));
@@ -1217,13 +1429,26 @@ pub fn stop(window: Window) {
 
 pub fn on_event(event: &NodeEvent) {
     match event {
+        NodeEvent::MirrorNotice { device, session, code } => {
+            if code == nectarlink_core::MIRROR_NOTICE_INPUT_BLOCKED {
+                let window = Window { device: *device, session: *session };
+                set_notice_for(
+                    window,
+                    tr!(
+                        "Mirror",
+                        "The phone ignores taps from this PC. In its Developer options, turn on USB debugging (Security settings)."
+                    ),
+                    Duration::from_secs(12),
+                );
+            }
+        }
         NodeEvent::Mirroring { device, session, on: true } => {
             let window = Window { device: *device, session: *session };
             set_phase(window, Phase::Showing);
             if *session != MIRROR_SCREEN {
                 follow_app_windows(*device);
                 // Keep awake / screen off, as set for this phone, apply to its app windows too.
-                let (stay_awake, screen_off) = state(|s| power(s, device));
+                let (stay_awake, screen_off) = app_power(&window);
                 if (stay_awake || screen_off)
                     && let Some(node) = core_host::node()
                 {
@@ -1260,6 +1485,9 @@ pub fn on_event(event: &NodeEvent) {
                 if cleared_kb {
                     core_host::host().hub.changed(Changes::MIRROR);
                 }
+            }
+            if finish_restart(window) {
+                return;
             }
             let showing = matches!(phase(&window), Some(Phase::Showing));
             let unproven = *session == MIRROR_SCREEN && set_unproven(*device, false);

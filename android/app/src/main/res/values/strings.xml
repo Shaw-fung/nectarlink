@@ -121,7 +121,7 @@
     <string name="elevated_pair_title">Pair NectarLink with Wireless debugging</string>
     <string name="elevated_pair_text">In Wireless debugging, tap Pair device with pairing code, then type the code here.</string>
     <string name="elevated_pair_action">Enter code</string>
-    <string name="elevated_pair_collapsed">Swipe this notification down, then tap Enter code.</string>
+    <string name="elevated_pair_collapsed">Swipe this notification down (on Xiaomi phones, long-press it), then tap Enter code.</string>
     <string name="elevated_pair_hint">6-digit pairing code</string>
     <string name="elevated_pairing">Pairing…</string>
     <string name="elevated_no_dialog">The pairing code isn\'t showing. In Wireless debugging, tap Pair device with pairing code, then type it here.</string>
@@ -294,6 +294,7 @@
     <string name="update_check_failed">Couldn’t check for updates. Check your internet connection.</string>
     <string name="action_lock_pc">Lock PC</string>
     <string name="action_sleep_pc">Sleep</string>
+    <string name="action_hibernate_pc">Hibernate</string>
     <string name="action_wake_pc">Wake</string>
     <string name="action_disconnect">Disconnect</string>
     <string name="action_stop_reconnecting">Stop reconnecting</string>
@@ -304,6 +305,7 @@
     <string name="wake_not_ready">Connect to %1$s once so this phone learns its network address.</string>
     <string name="pc_locked">%1$s is locked.</string>
     <string name="pc_sleeping">%1$s is going to sleep.</string>
+    <string name="pc_hibernating">%1$s is hibernating.</string>
     <string name="pc_actions_off">Locking and sleep are turned off for this phone on %1$s.</string>
     <string name="channel_links">Links from your PC</string>
     <!-- Play on phone: what a PC plays, streamed to the phone. -->
@@ -396,7 +398,7 @@
     <string name="pc_mirror_task_view">Task View</string>
     <string name="pc_mirror_keyboard">Keyboard</string>
     <string name="pc_mirror_hide_keyboard">Hide keys</string>
-    <string name="pc_mirror_send_text">Send</string>
+    <string name="pc_mirror_enter">Enter</string>
     <string name="pc_mirror_backspace">Backspace</string>
     <string name="pc_mirror_quality_720p">720p</string>
     <string name="pc_mirror_quality_1080p">1080p</string>
@@ -1158,7 +1160,7 @@
     <!-- 16. App streams -->
     <string name="guide_apps_title">App streams</string>
     <string name="guide_apps_summary">Open individual Android apps in dedicated windows on your PC while your phone screen stays independent.</string>
-    <string name="guide_apps_where">Settings › Permissions › Control from your PC › Real touch and keys (Wireless debugging)</string>
+    <string name="guide_apps_where">Settings › Permissions › Control from your PC › Elevated</string>
     <string name="guide_apps_needs">Elevated (Wireless debugging)</string>
     <string name="guide_apps_need_1">Elevated, set up through Wireless debugging.</string>
     <string name="guide_apps_need_2">Online paired PC.</string>
@@ -1232,11 +1234,11 @@
 
     <!-- 22. Elevated -->
     <string name="guide_elevated_title">Elevated</string>
-    <string name="guide_elevated_summary">Real touch and keys, App streams, background clipboard sync and in-call controls, through Wireless debugging.</string>
-    <string name="guide_elevated_where">Settings › Permissions › Control from your PC › Real touch and keys (Wireless debugging)</string>
+    <string name="guide_elevated_summary">Real touch and keys, App streams, background clipboard sync and in-call controls, through Wireless debugging, Shizuku or root.</string>
+    <string name="guide_elevated_where">Settings › Permissions › Control from your PC › Elevated</string>
     <string name="guide_elevated_needs">Wireless debugging</string>
     <string name="guide_elevated_need_1">Developer options and Wireless debugging turned on.</string>
-    <string name="guide_elevated_phone_1">Open Settings › Permissions › Control from your PC and tap Set up under Real touch and keys.</string>
+    <string name="guide_elevated_phone_1">Open Settings › Permissions › Control from your PC and tap Set up under Elevated.</string>
     <string name="guide_elevated_phone_2">In Wireless debugging, tap Pair device with pairing code and enter the 6-digit code in the notification.</string>
     <string name="guide_elevated_pc_1">Use App streams, background clipboard sync, and low-latency input from your PC.</string>
     <string name="guide_elevated_opt_1">Set up / Turn off: Pairs or stops the local Wireless debugging helper.</string>

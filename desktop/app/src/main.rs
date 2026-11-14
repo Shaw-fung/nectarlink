@@ -41,6 +41,7 @@ mod pc_audio_stream;
 mod pc_mirror;
 mod pc_notifications;
 mod pc_storage;
+mod phone_install;
 mod phone_mic;
 mod phone_sound;
 mod photo_backup;
@@ -594,6 +595,8 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     win::quit_on_signals(bridge::app::request_quit);
     win::jumplist::register(options.data_dir.as_deref());
+    // Before the core looks for adb: one downloaded for phones on a cable is used too.
+    phone_install::init(&data_dir);
     if let Err(e) = core_host::start(data_dir.clone(), Arc::new(DesktopPlatform)) {
         tracing::error!(error = %e, "can't start the core runtime");
         return ExitCode::FAILURE;
@@ -731,6 +734,7 @@ fn main() -> ExitCode {
         bridge::native::ffi::add_app_icon_image(size, &mark::render(size as usize));
     }
     bridge::native::ffi::apply_app_icon();
+    bridge::native::ffi::stay_out_of_session_restore();
 
     if let Some(instance) = instance {
         let data_dir = data_dir.clone();

@@ -48,6 +48,8 @@ pub mod usb;
 pub mod webcam;
 
 pub use actions::{PC_WAKE, PowerAction};
+/// Offered by PCs that can hibernate right now.
+pub const PC_HIBERNATE: &str = nectarlink_protocol::messages::pc_power::HIBERNATE;
 pub use calls::CallCommand;
 pub use clip_kind::{
     ClipKind, ClipSuggestion, classify_clip, maps_web_url, percent_encode, tracking_search_url,
@@ -81,6 +83,9 @@ pub use localsend::{
 pub use media::{MediaAction, MediaError};
 pub use mic::{MicSink, TOGGLE as MIC_TOGGLE};
 pub use mirror::{MirrorSend, MirrorSink, MirrorStream, PC_MIRROR_TOGGLE};
+pub use nectarlink_adb::{
+    locate_adb, server_answers as adb_server_answers, start_server as start_adb_server,
+};
 pub use nectarlink_protocol::messages::clip::{
     IMAGE_TYPES as CLIP_IMAGE_TYPES, MAX_IMAGE_BYTES as CLIP_MAX_IMAGE_BYTES,
 };
@@ -115,8 +120,8 @@ pub use nectarlink_protocol::{
             AUDIO as MIRROR_AUDIO, AUDIO_PLAYBACK as MIRROR_AUDIO_PLAYBACK, AV1 as MIRROR_AV1,
             CAPTURE as MIRROR_CAPTURE, H264 as MIRROR_H264, H265 as MIRROR_H265, HEVC as MIRROR_HEVC,
             INPUT as MIRROR_INPUT, LISTEN as MIRROR_LISTEN, MAX_TEXT_BYTES as MIRROR_MAX_TEXT_BYTES,
-            PCM as MIRROR_PCM, SCREEN as MIRROR_SCREEN, SOUND as MIRROR_SOUND, VIEW as MIRROR_VIEW,
-            VIRTUAL_DISPLAY as MIRROR_VIRTUAL_DISPLAY,
+            NOTICE_INPUT_BLOCKED as MIRROR_NOTICE_INPUT_BLOCKED, PCM as MIRROR_PCM, SCREEN as MIRROR_SCREEN,
+            SOUND as MIRROR_SOUND, VIEW as MIRROR_VIEW, VIRTUAL_DISPLAY as MIRROR_VIRTUAL_DISPLAY,
         },
         mirror_keys, notify_limits, parse_mac,
         photos::{

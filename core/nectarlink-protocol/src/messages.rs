@@ -82,6 +82,7 @@ pub mod types {
     pub const MIRROR_RESIZE: &str = "mirror.resize";
     pub const MIRROR_INPUT: &str = "mirror.input";
     pub const MIRROR_APPS: &str = "mirror.apps";
+    pub const MIRROR_NOTICE: &str = "mirror.notice";
     pub const REMOTE_CHECK: &str = "remote.check";
     pub const REMOTE_INPUT: &str = "remote.input";
     pub const PHONE_TOGGLES: &str = "phone.toggles";
@@ -1150,10 +1151,17 @@ impl MediaWatch {
 
 // ---- Actions (docs/protocol/actions.md) ----
 
-/// Body of `pc.power`: `lock` or `sleep`.
+/// Body of `pc.power`: `lock`, `sleep`, or `hibernate` (only to a PC that
+/// offers [`pc_power::HIBERNATE`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PcPower {
     pub action: String,
+}
+
+pub mod pc_power {
+    /// Offered by PCs that can hibernate right now (it can be turned off, or
+    /// have nowhere to save to).
+    pub const HIBERNATE: &str = "pc.power.hibernate";
 }
 
 /// The longest link sent, in bytes.
@@ -1392,6 +1400,9 @@ pub mod mirror {
     pub const MAX_APPS: usize = 500;
     /// An app's icon (PNG), at most.
     pub const MAX_ICON_BYTES: usize = 8 * 1024;
+    /// `mirror.notice`: the phone refuses the PC's taps and keys (on Xiaomi,
+    /// until USB debugging (Security settings) is on).
+    pub const NOTICE_INPUT_BLOCKED: &str = "input_blocked";
 }
 
 /// Whether `name` looks like an Android package name.
@@ -1496,19 +1507,45 @@ pub struct MirrorSession {
     pub session: u32,
 }
 
+/// Body of `mirror.notice` (phone → PC): something the PC should tell its
+/// user about a mirroring, by a code it knows (`mirror::NOTICE_*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MirrorNotice {
+    #[serde(default)]
+    pub session: u32,
+    pub code: String,
+}
+
+impl MirrorNotice {
+    pub fn is_valid(&self) -> bool {
+        (1..=32).contains(&self.code.len()) && self.code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    }
+}
+
 /// Body of `mirror.resize`: resize an app window's display (`session != 0`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorResize {
     pub session: u32,
     pub width: u32,
     pub height: u32,
+    /// How big the app draws, in percent of the display's usual density
+    /// (100 from PCs that don't say; phones from before this ignore it).
+    #[serde(default = "MirrorResize::usual_zoom")]
+    pub zoom: u32,
 }
 
 impl MirrorResize {
+    pub const ZOOM: std::ops::RangeInclusive<u32> = 50..=200;
+
+    fn usual_zoom() -> u32 {
+        100
+    }
+
     pub fn is_valid(&self) -> bool {
         self.session != mirror::SCREEN
             && (64..=4096).contains(&self.width)
             && (64..=4096).contains(&self.height)
+            && Self::ZOOM.contains(&self.zoom)
     }
 }
 
@@ -1588,6 +1625,9 @@ pub mod mirror_keys {
     pub const SELECT_ALL: &str = "select_all";
     /// Locks the phone. Phones from before this drop it.
     pub const LOCK: &str = "lock";
+    /// Presses the focused chat box's Send (the PC's Enter, with "Enter sends
+    /// messages" on). Phones from before this drop it.
+    pub const SEND: &str = "send";
     pub const ALL: &[&str] = &[
         BACK,
         HOME,
@@ -1607,6 +1647,7 @@ pub mod mirror_keys {
         CUT,
         SELECT_ALL,
         LOCK,
+        SEND,
     ];
 }
 
@@ -5087,7 +5128,13 @@ mod tests {
         assert!(!MirrorInput::Touch { action: TouchAction::Up, x: f32::NAN, y: 0.0 }.is_valid());
         assert!(MirrorInput::Key { key: "back".into() }.is_valid());
         assert!(!MirrorInput::Key { key: "power".into() }.is_valid());
-        for key in [mirror_keys::COPY, mirror_keys::CUT, mirror_keys::SELECT_ALL] {
+        for key in [
+            mirror_keys::COPY,
+            mirror_keys::CUT,
+            mirror_keys::SELECT_ALL,
+            mirror_keys::LOCK,
+            mirror_keys::SEND,
+        ] {
             assert!(MirrorInput::Key { key: key.into() }.is_valid());
         }
         assert!(!MirrorInput::Text { text: String::new() }.is_valid());
@@ -6157,5 +6204,17 @@ mod tests {
         let env = crate::Envelope::new(types::AUDIO_PCM, &frame).unwrap();
         let decoded: AudioPcmFrame = crate::Envelope::from_cbor(&env.to_cbor()).unwrap().body().unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn mirror_notices_carry_a_short_code() {
+        let notice = MirrorNotice { session: 3, code: mirror::NOTICE_INPUT_BLOCKED.into() };
+        assert!(notice.is_valid());
+        let env = crate::Envelope::new(types::MIRROR_NOTICE, &notice).unwrap();
+        let decoded: MirrorNotice = crate::Envelope::from_cbor(&env.to_cbor()).unwrap().body().unwrap();
+        assert_eq!(decoded, notice);
+        for code in ["", "Input_Blocked", "input blocked", &"a".repeat(33), "über"] {
+            assert!(!MirrorNotice { session: 0, code: code.into() }.is_valid(), "{code}");
+        }
     }
 }
