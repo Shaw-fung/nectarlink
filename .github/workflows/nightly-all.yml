@@ -22,6 +22,7 @@ on:
   schedule:
     # 18:00 UTC == 02:00 Beijing. Sync + build once a day; the "changed" gate
     # below skips the build on days upstream hasn't moved.
+    # (keepalive: re-registered 2026-11-14 so GitHub's scheduler keeps firing)
     - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:

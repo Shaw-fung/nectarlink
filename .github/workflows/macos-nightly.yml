@@ -22,7 +22,7 @@ on:
     workflows: ["Nightly all"]
     types: [completed]
   schedule:
-    - cron: "30 19 * * *"   # ~1.5h after the nightly build, retry window
+    - cron: "30 19 * * *"   # ~1.5h after the nightly build, retry window (keepalive 2026-11-14)
   workflow_dispatch:
     inputs:
       force:
