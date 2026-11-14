@@ -15,6 +15,10 @@ change things that need a step from you, and its notes say so.
   When the phone refuses, it says why and what to do. For phones where Play Protect or
   the maker blocks installing from a browser. The adb it downloads also connects phones
   over a cable from then on.
+- **Scrollbars.** Long pages on the PC (Home, Settings, Timeline, Messages, Photos, Calls,
+  Apps, Deck) and sheets show a thin scrollbar while they scroll or when the pointer is near
+  their edge; drag it, or click to jump. Thanks to [@Dipen425](https://github.com/Dipen425)
+  ([#387](https://github.com/thtbee/nectarlink/issues/387)).
 - **Flex mode for app windows.** A button in an app window's toolbar turns off fitting
   the app to the window, for apps that don't take odd shapes well: the app restarts at
   the phone's resolution and the window keeps that shape when resized. It's remembered
@@ -154,6 +158,17 @@ change things that need a step from you, and its notes say so.
 
 ### Fixed
 
+- **Recording a mirror saves on Windows when the phone streams H.265.** It stopped with
+  "required headers were not provided", since the recording was written as H.264. On
+  Linux, an H.265 mirror says it can't be recorded yet instead of failing at the end.
+  Thanks to [@znbaboy](https://github.com/znbaboy) ([#393](https://github.com/thtbee/nectarlink/issues/393)).
+- **The phone's seek bar for what the PC plays stays put.** It disappeared whenever a
+  player on the PC dropped its timeline for a moment, around play and pause. Thanks to
+  [@znbaboy](https://github.com/znbaboy) ([#392](https://github.com/thtbee/nectarlink/issues/392)).
+- **Chinese, Japanese and Korean text uses Windows' own UI fonts.** Chinese showed in a
+  serif font like SimSun that was hard to read; it now uses Microsoft YaHei UI (or the
+  matching font for Traditional Chinese, Japanese and Korean). Thanks to
+  [@ManuZhu0728](https://github.com/ManuZhu0728) ([#390](https://github.com/thtbee/nectarlink/issues/390)).
 - **The phone vibrates again when the PC doesn't show its notifications.** While you
   used the PC, the phone silenced its own notification sounds and vibration, even with
   notifications turned off for that PC or paused. Now it only does that while the PC
@@ -192,6 +207,9 @@ change things that need a step from you, and its notes say so.
 - **The Linux updater's tests cover ARM64 packages**, a first step towards Linux ARM64 builds
   ([#356](https://github.com/thtbee/nectarlink/issues/356)). Thanks to
   [@localzet](https://github.com/localzet) ([#363](https://github.com/thtbee/nectarlink/pull/363)).
+- **Handoff spots videos and maps in links with a port**, like `youtube.com:443`, and
+  keeps a Vimeo time right. Thanks to [@localzet](https://github.com/localzet) ([#391](https://github.com/thtbee/nectarlink/pull/391)).
+- **The Theme picker in Settings › Appearance no longer sits over its label.**
 - **Waking a PC through another device says when no packet went out**, instead of
   reporting success. Thanks to [@localzet](https://github.com/localzet) ([#385](https://github.com/thtbee/nectarlink/pull/385)).
 - **The Linux install tests fail when they should**: uninstalling, and a damaged package
