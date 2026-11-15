@@ -15,6 +15,9 @@ change things that need a step from you, and its notes say so.
   When the phone refuses, it says why and what to do. For phones where Play Protect or
   the maker blocks installing from a browser. The adb it downloads also connects phones
   over a cable from then on.
+- **Select a whole day of photos.** On the PC's Photos page, click the day at the top of
+  the grid to select everything from that day; click it again to clear it. Thanks to
+  [@Dipen425](https://github.com/Dipen425) ([#388](https://github.com/thtbee/nectarlink/issues/388)).
 - **Scrollbars.** Long pages on the PC (Home, Settings, Timeline, Messages, Photos, Calls,
   Apps, Deck) and sheets show a thin scrollbar while they scroll or when the pointer is near
   their edge; drag it, or click to jump. Thanks to [@Dipen425](https://github.com/Dipen425)
@@ -55,7 +58,8 @@ change things that need a step from you, and its notes say so.
 - **Keep a mirror window on top.** A pin button in the window's controls keeps it above other windows. Thanks to [@Nebhay](https://github.com/Nebhay) ([#327](https://github.com/thtbee/nectarlink/pull/327)).
 - **Spanish.** NectarLink is available in Spanish on Android and Windows.
   Thanks to José María Garcia Dominguez, and to
-  [@KevinL50-sysadmin](https://github.com/KevinL50-sysadmin) for a review pass on it.
+  [@KevinL50-sysadmin](https://github.com/KevinL50-sysadmin) for review passes on it
+  ([#348](https://github.com/thtbee/nectarlink/pull/348), [#402](https://github.com/thtbee/nectarlink/pull/402)).
 
 - **Vietnamese.** NectarLink speaks Tiếng Việt now: on the Android phone and
   the Windows PC, every screen is translated. Language (Settings › Appearance on the
@@ -207,6 +211,11 @@ change things that need a step from you, and its notes say so.
 - **The Linux updater's tests cover ARM64 packages**, a first step towards Linux ARM64 builds
   ([#356](https://github.com/thtbee/nectarlink/issues/356)). Thanks to
   [@localzet](https://github.com/localzet) ([#363](https://github.com/thtbee/nectarlink/pull/363)).
+- **Relays through a chosen network interface on Linux try every address**: one that
+  can't be set up (IPv6 on that interface, say) no longer stops the IPv4 one being tried.
+  Thanks to [@localzet](https://github.com/localzet) ([#396](https://github.com/thtbee/nectarlink/pull/396)).
+- **Deleting photos from the PC counts what the phone deleted correctly**, and a phone
+  can't claim more than were asked for. Thanks to [@localzet](https://github.com/localzet) ([#395](https://github.com/thtbee/nectarlink/pull/395)).
 - **Handoff spots videos and maps in links with a port**, like `youtube.com:443`, and
   keeps a Vimeo time right. Thanks to [@localzet](https://github.com/localzet) ([#391](https://github.com/thtbee/nectarlink/pull/391)).
 - **The Theme picker in Settings › Appearance no longer sits over its label.**
